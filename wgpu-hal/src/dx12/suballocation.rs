@@ -10,6 +10,88 @@ use crate::{
     AllocationSizes,
 };
 
+// `gpu-allocator` 0.28.0 declares `windows = ">=0.53, <=0.62"` in its
+// Cargo.toml. That range spans multiple semver-incompatible groups, so when a
+// downstream dependency (e.g. `cpal 0.15`) forces `windows 0.54` into the
+// graph, cargo resolves `gpu-allocator` against the older version while
+// `wgpu-hal` itself stays on `windows 0.62`. The dx12 backend then cannot
+// pass `ID3D12Device`/`ID3D12Heap` handles or `D3D12_RESOURCE_DESC` values
+// to `gpu-allocator` because the types are nominally different even though
+// their COM ABI is identical. The helpers below bridge the two versions for
+// the few call sites that cross the boundary.
+//
+// Upstream wgpu has not fixed this because their own workspace lockfile never
+// drags in cpal; the mismatch only surfaces in dependent graphs. Tracking
+// upstream: https://github.com/gfx-rs/wgpu/issues (no issue at time of patch).
+// TODO: drop this shim once `gpu-allocator` narrows its `windows` range or
+// wgpu vendors its d3d12 allocator.
+mod gpu_allocator_bridge {
+    use super::Direct3D12;
+
+    /// Clone `raw` and alias the resulting handle as whatever `ID3D12Device`
+    /// type `gpu-allocator` was compiled against.
+    ///
+    /// # Safety
+    /// Both the local `Direct3D12::ID3D12Device` (windows 0.62) and the
+    /// `ID3D12Device` type `gpu_allocator::d3d12::ID3D12DeviceVersion::Device`
+    /// expects are `#[repr(transparent)]` newtypes around `windows_core::IUnknown`,
+    /// which is itself `#[repr(transparent)]` over a non-null COM interface
+    /// pointer. Their in-memory representations are therefore identical and
+    /// independent of the windows-rs crate version. `ManuallyDrop` ensures the
+    /// local clone is not dropped; ownership of the refcount is transferred to
+    /// the returned aliased handle, which `gpu-allocator` will `Release` when
+    /// done.
+    pub(super) fn alias_device_clone(
+        raw: &Direct3D12::ID3D12Device,
+    ) -> gpu_allocator::d3d12::ID3D12DeviceVersion {
+        let owned = core::mem::ManuallyDrop::new(raw.clone());
+        // Destination type is inferred from the enum variant payload.
+        let aliased = unsafe { core::mem::transmute_copy(&owned) };
+        gpu_allocator::d3d12::ID3D12DeviceVersion::Device(aliased)
+    }
+
+    /// Alias `gpu-allocator`'s `&ID3D12Heap` as our windows 0.62 reference
+    /// and clone it (bumping the COM refcount) so it can be passed to
+    /// `ID3D12Device::CreatePlacedResource`.
+    ///
+    /// # Safety
+    /// `ID3D12Heap` is `#[repr(transparent)]` over `IUnknown` in both windows
+    /// 0.54 and 0.62; the reference layouts are identical.
+    pub(super) fn alias_heap_clone(
+        allocation: &gpu_allocator::d3d12::Allocation,
+    ) -> Direct3D12::ID3D12Heap {
+        // SAFETY: see above. `allocation.heap()` is `unsafe` because the caller
+        // must not outlive the allocation; we clone immediately and only
+        // consume the reference to produce an owned refcount, which `gpu-allocator`
+        // tracks separately via the allocation itself.
+        unsafe {
+            let heap_ref: &Direct3D12::ID3D12Heap =
+                core::mem::transmute(allocation.heap());
+            heap_ref.clone()
+        }
+    }
+
+    /// Replacement for `gpu_allocator::d3d12::ResourceCategory::from(&desc)`
+    /// which only exists for the windows version `gpu-allocator` was built
+    /// against. The logic mirrors the upstream impl verbatim.
+    pub(super) fn resource_category_from_desc(
+        desc: &Direct3D12::D3D12_RESOURCE_DESC,
+    ) -> gpu_allocator::d3d12::ResourceCategory {
+        use gpu_allocator::d3d12::ResourceCategory;
+        if desc.Dimension == Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER {
+            ResourceCategory::Buffer
+        } else if (desc.Flags
+            & (Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            != Direct3D12::D3D12_RESOURCE_FLAG_NONE
+        {
+            ResourceCategory::RtvDsvTexture
+        } else {
+            ResourceCategory::OtherTexture
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum AllocationType {
     Buffer,
@@ -80,7 +162,7 @@ impl Allocator {
         let host_memblock_size = allocation_sizes.min_host_memblock_size;
 
         let allocator_desc = gpu_allocator::d3d12::AllocatorCreateDesc {
-            device: gpu_allocator::d3d12::ID3D12DeviceVersion::Device(raw.clone()),
+            device: gpu_allocator_bridge::alias_device_clone(raw),
             debug_settings: Default::default(),
             allocation_sizes: allocation_sizes.into(),
         };
@@ -296,14 +378,15 @@ impl<'a> DeviceAllocationContext<'a> {
             location,
             size: allocation_info.SizeInBytes,
             alignment: allocation_info.Alignment,
-            resource_category: gpu_allocator::d3d12::ResourceCategory::from(&raw_desc),
+            resource_category: gpu_allocator_bridge::resource_category_from_desc(&raw_desc),
         };
 
         let allocation = allocator.allocate(&allocation_desc)?;
+        let heap = gpu_allocator_bridge::alias_heap_clone(&allocation);
         let mut resource = None;
         unsafe {
             self.raw.CreatePlacedResource(
-                allocation.heap(),
+                &heap,
                 allocation.offset(),
                 &raw_desc,
                 Direct3D12::D3D12_RESOURCE_STATE_COMMON,
@@ -335,14 +418,15 @@ impl<'a> DeviceAllocationContext<'a> {
             location,
             size: allocation_info.SizeInBytes,
             alignment: allocation_info.Alignment,
-            resource_category: gpu_allocator::d3d12::ResourceCategory::from(&raw_desc),
+            resource_category: gpu_allocator_bridge::resource_category_from_desc(&raw_desc),
         };
 
         let allocation = allocator.allocate(&allocation_desc)?;
+        let heap = gpu_allocator_bridge::alias_heap_clone(&allocation);
         let mut resource = None;
         unsafe {
             self.raw.CreatePlacedResource(
-                allocation.heap(),
+                &heap,
                 allocation.offset(),
                 &raw_desc,
                 Direct3D12::D3D12_RESOURCE_STATE_COMMON,
@@ -374,14 +458,15 @@ impl<'a> DeviceAllocationContext<'a> {
             location,
             size: allocation_info.SizeInBytes,
             alignment: allocation_info.Alignment,
-            resource_category: gpu_allocator::d3d12::ResourceCategory::from(&raw_desc),
+            resource_category: gpu_allocator_bridge::resource_category_from_desc(&raw_desc),
         };
 
         let allocation = allocator.allocate(&allocation_desc)?;
+        let heap = gpu_allocator_bridge::alias_heap_clone(&allocation);
         let mut resource = None;
         unsafe {
             self.raw.CreatePlacedResource(
-                allocation.heap(),
+                &heap,
                 allocation.offset(),
                 &raw_desc,
                 Direct3D12::D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
