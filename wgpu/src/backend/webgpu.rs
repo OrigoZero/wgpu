@@ -974,16 +974,20 @@ fn future_request_device(
             let device = webgpu_sys::GpuDevice::from(js_value);
             let queue = device.queue();
 
+            let release_queue = Rc::new(ReleaseQueue::default());
+
             (
                 WebDevice {
                     inner: device,
                     ident: crate::cmp::Identifier::create(),
                     error_scope_count: Rc::new(Cell::new(0)),
+                    release_queue: release_queue.clone(),
                 }
                 .into(),
                 WebQueue {
                     inner: queue,
                     ident: crate::cmp::Identifier::create(),
+                    release_queue,
                 }
                 .into(),
             )
@@ -1197,6 +1201,78 @@ pub struct WebAdapter {
     ident: crate::cmp::Identifier,
 }
 
+/// A GPU allocation the browser frees on `destroy()`: a buffer, a texture or a
+/// query set. The JavaScript handle alone holds the allocation until the
+/// garbage collector runs, and the collector measures no GPU bytes.
+#[derive(Debug, Clone)]
+enum Releasable {
+    Buffer(webgpu_sys::GpuBuffer),
+    Texture(webgpu_sys::GpuTexture),
+    QuerySet(webgpu_sys::GpuQuerySet),
+}
+
+impl Releasable {
+    fn destroy(&self) {
+        match self {
+            Self::Buffer(buffer) => buffer.destroy(),
+            Self::Texture(texture) => texture.destroy(),
+            Self::QuerySet(query_set) => query_set.destroy(),
+        }
+    }
+}
+
+/// The allocations whose last Rust holder dropped since the queue's previous
+/// submit. A device shares one with its queue and with every buffer, texture
+/// and query set it creates. The queue destroys the contents right after each
+/// submit, once every command buffer recorded against them is with the queue,
+/// so the memory of a dropped allocation returns at the next submit.
+#[derive(Debug, Default)]
+struct ReleaseQueue {
+    pending: RefCell<Vec<Releasable>>,
+}
+
+impl ReleaseQueue {
+    fn defer(&self, allocation: Releasable) {
+        self.pending.borrow_mut().push(allocation);
+    }
+
+    fn destroy_pending(&self) {
+        let pending = core::mem::take(&mut *self.pending.borrow_mut());
+        for allocation in pending {
+            allocation.destroy();
+        }
+    }
+}
+
+/// Keeps an allocation alive for as long as any clone of it exists: the
+/// allocation's own handle holds one, and so does every texture view, bind
+/// group and render bundle that references the allocation, the way wgpu-core
+/// holds a reference for each of those. Dropping the last clone hands the
+/// allocation to the release queue.
+#[derive(Debug)]
+struct ReleaseOnDrop {
+    allocation: Releasable,
+    queue: Rc<ReleaseQueue>,
+}
+
+impl ReleaseOnDrop {
+    fn new(allocation: Releasable, queue: &Rc<ReleaseQueue>) -> Rc<Self> {
+        Rc::new(Self {
+            allocation,
+            queue: queue.clone(),
+        })
+    }
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.queue.defer(self.allocation.clone());
+    }
+}
+
+/// A clone of the token of every allocation a bound resource reaches.
+type Holds = Vec<Rc<ReleaseOnDrop>>;
+
 #[derive(Debug, Clone)]
 pub struct WebDevice {
     pub(crate) inner: webgpu_sys::GpuDevice,
@@ -1204,6 +1280,8 @@ pub struct WebDevice {
     ident: crate::cmp::Identifier,
     /// Current number of error scopes that have been pushed on the device.
     error_scope_count: Rc<Cell<u32>>,
+    /// Dropped allocations awaiting the queue's next submit.
+    release_queue: Rc<ReleaseQueue>,
 }
 
 #[derive(Debug, Clone)]
@@ -1211,6 +1289,8 @@ pub struct WebQueue {
     pub(crate) inner: webgpu_sys::GpuQueue,
     /// Unique identifier for this Queue.
     ident: crate::cmp::Identifier,
+    /// Dropped allocations this queue destroys after each submit.
+    release_queue: Rc<ReleaseQueue>,
 }
 
 #[derive(Debug, Clone)]
@@ -1225,6 +1305,8 @@ pub struct WebBindGroup {
     pub(crate) inner: webgpu_sys::GpuBindGroup,
     /// Unique identifier for this BindGroup.
     ident: crate::cmp::Identifier,
+    /// The buffers and textures the group binds, alive while the group is.
+    holds: Rc<Holds>,
 }
 
 #[derive(Debug, Clone)]
@@ -1232,6 +1314,9 @@ pub struct WebTextureView {
     pub(crate) inner: webgpu_sys::GpuTextureView,
     /// Unique identifier for this TextureView.
     ident: crate::cmp::Identifier,
+    /// The texture this view reads, alive while the view is. A view of the
+    /// surface's current texture holds none: the canvas owns that texture.
+    release: Option<Rc<ReleaseOnDrop>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1263,11 +1348,18 @@ pub struct WebBuffer {
     mapping: Rc<RefCell<WebBufferMapState>>,
     /// Unique identifier for this Buffer.
     ident: crate::cmp::Identifier,
+    /// Destroys the buffer once its last holder drops.
+    release: Rc<ReleaseOnDrop>,
 }
 
 impl WebBuffer {
     /// Creates a new web buffer for the given Javascript object and description.
-    fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
+    fn new(
+        inner: webgpu_sys::GpuBuffer,
+        desc: &crate::BufferDescriptor<'_>,
+        release_queue: &Rc<ReleaseQueue>,
+    ) -> Self {
+        let release = ReleaseOnDrop::new(Releasable::Buffer(inner.clone()), release_queue);
         Self {
             inner,
             mapping: Rc::new(RefCell::new(WebBufferMapState {
@@ -1275,6 +1367,7 @@ impl WebBuffer {
                 range: 0..desc.size,
             })),
             ident: crate::cmp::Identifier::create(),
+            release,
         }
     }
 
@@ -1308,6 +1401,9 @@ pub struct WebTexture {
     pub(crate) inner: webgpu_sys::GpuTexture,
     /// Unique identifier for this Texture.
     ident: crate::cmp::Identifier,
+    /// Destroys the texture once its last holder drops. The surface's current
+    /// texture holds none: the canvas owns it and expires it when it presents.
+    release: Option<Rc<ReleaseOnDrop>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1333,6 +1429,8 @@ pub struct WebQuerySet {
     pub(crate) inner: webgpu_sys::GpuQuerySet,
     /// Unique identifier for this QuerySet.
     ident: crate::cmp::Identifier,
+    /// Destroys the query set once its last holder drops.
+    release: Rc<ReleaseOnDrop>,
 }
 
 #[derive(Debug, Clone)]
@@ -1395,6 +1493,8 @@ pub struct WebRenderBundleEncoder {
     pub(crate) inner: webgpu_sys::GpuRenderBundleEncoder,
     /// Unique identifier for this RenderBundleEncoder.
     ident: crate::cmp::Identifier,
+    /// The buffers and bind groups recorded so far, alive while the bundle is.
+    holds: Holds,
 }
 
 #[derive(Debug, Clone)]
@@ -1402,6 +1502,8 @@ pub struct WebRenderBundle {
     pub(crate) inner: webgpu_sys::GpuRenderBundle,
     /// Unique identifier for this RenderBundle.
     ident: crate::cmp::Identifier,
+    /// The buffers and textures the bundle draws with, alive while the bundle is.
+    holds: Rc<Holds>,
 }
 
 #[derive(Debug, Clone)]
@@ -2068,6 +2170,7 @@ impl dispatch::DeviceInterface for WebDevice {
         &self,
         desc: &crate::BindGroupDescriptor<'_>,
     ) -> dispatch::DispatchBindGroup {
+        let mut holds = Holds::new();
         let mapped_entries = desc
             .entries
             .iter()
@@ -2079,6 +2182,7 @@ impl dispatch::DeviceInterface for WebDevice {
                         size,
                     }) => {
                         let buffer = buffer.inner.as_webgpu();
+                        holds.push(buffer.release.clone());
                         let mapped_buffer_binding =
                             webgpu_sys::GpuBufferBinding::new(&buffer.inner);
                         mapped_buffer_binding.set_offset(offset as f64);
@@ -2098,8 +2202,9 @@ impl dispatch::DeviceInterface for WebDevice {
                         panic!("Web backend does not support arrays of samplers")
                     }
                     crate::BindingResource::TextureView(texture_view) => {
-                        let texture_view = &texture_view.inner.as_webgpu().inner;
-                        JsValue::from(texture_view)
+                        let texture_view = texture_view.inner.as_webgpu();
+                        holds.extend(texture_view.release.iter().cloned());
+                        JsValue::from(&texture_view.inner)
                     }
                     crate::BindingResource::TextureViewArray(..) => {
                         panic!("Web backend does not support BINDING_INDEXING extension")
@@ -2129,6 +2234,7 @@ impl dispatch::DeviceInterface for WebDevice {
         WebBindGroup {
             inner: bind_group,
             ident: crate::cmp::Identifier::create(),
+            holds: Rc::new(holds),
         }
         .into()
     }
@@ -2328,7 +2434,12 @@ impl dispatch::DeviceInterface for WebDevice {
         if let Some(label) = desc.label {
             mapped_desc.set_label(label);
         }
-        WebBuffer::new(self.inner.create_buffer(&mapped_desc).unwrap(), desc).into()
+        WebBuffer::new(
+            self.inner.create_buffer(&mapped_desc).unwrap(),
+            desc,
+            &self.release_queue,
+        )
+        .into()
     }
 
     fn create_texture(&self, desc: &crate::TextureDescriptor<'_>) -> dispatch::DispatchTexture {
@@ -2351,9 +2462,11 @@ impl dispatch::DeviceInterface for WebDevice {
         mapped_desc.set_view_formats(&mapped_view_formats);
 
         let texture = self.inner.create_texture(&mapped_desc).unwrap();
+        let release = ReleaseOnDrop::new(Releasable::Texture(texture.clone()), &self.release_queue);
         WebTexture {
             inner: texture,
             ident: crate::cmp::Identifier::create(),
+            release: Some(release),
         }
         .into()
     }
@@ -2417,10 +2530,13 @@ impl dispatch::DeviceInterface for WebDevice {
         }
 
         let query_set = self.inner.create_query_set(&mapped_desc).unwrap();
+        let release =
+            ReleaseOnDrop::new(Releasable::QuerySet(query_set.clone()), &self.release_queue);
 
         WebQuerySet {
             inner: query_set,
             ident: crate::cmp::Identifier::create(),
+            release,
         }
         .into()
     }
@@ -2476,6 +2592,7 @@ impl dispatch::DeviceInterface for WebDevice {
         WebRenderBundleEncoder {
             inner: render_bundle_encoder,
             ident: crate::cmp::Identifier::create(),
+            holds: Holds::new(),
         }
         .into()
     }
@@ -2709,6 +2826,7 @@ impl dispatch::QueueInterface for WebQueue {
             .collect::<js_sys::Array>();
 
         self.inner.submit(&array);
+        self.release_queue.destroy_pending();
 
         0
     }
@@ -2834,7 +2952,7 @@ impl dispatch::BufferInterface for WebBuffer {
 }
 impl Drop for WebBuffer {
     fn drop(&mut self) {
-        // no-op
+        // `release` hands the buffer to the queue once the last clone drops.
     }
 }
 
@@ -2869,6 +2987,7 @@ impl dispatch::TextureInterface for WebTexture {
         WebTextureView {
             inner: view,
             ident: crate::cmp::Identifier::create(),
+            release: self.release.clone(),
         }
         .into()
     }
@@ -2879,7 +2998,7 @@ impl dispatch::TextureInterface for WebTexture {
 }
 impl Drop for WebTexture {
     fn drop(&mut self) {
-        // no-op
+        // `release` hands the texture to the queue once the last clone drops.
     }
 }
 
@@ -2918,7 +3037,7 @@ impl Drop for WebTlas {
 impl dispatch::QuerySetInterface for WebQuerySet {}
 impl Drop for WebQuerySet {
     fn drop(&mut self) {
-        // no-op
+        // `release` hands the query set to the queue once the last clone drops.
     }
 }
 
@@ -3702,7 +3821,11 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
-        let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
+        let bind_group = bind_group.map(|bind_group| bind_group.as_webgpu());
+        if let Some(bind_group) = bind_group {
+            self.holds.extend(bind_group.holds.iter().cloned());
+        }
+        let bind_group = bind_group.map(|bind_group| &bind_group.inner);
 
         if offsets.is_empty() {
             self.inner.set_bind_group(index, bind_group);
@@ -3727,6 +3850,7 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         size: Option<crate::BufferSize>,
     ) {
         let buffer = buffer.as_webgpu();
+        self.holds.push(buffer.release.clone());
         let index_format = map_index_format(index_format);
 
         if let Some(size) = size {
@@ -3750,6 +3874,7 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         size: Option<crate::BufferSize>,
     ) {
         let buffer = buffer.as_webgpu();
+        self.holds.push(buffer.release.clone());
 
         if let Some(size) = size {
             self.inner.set_vertex_buffer_with_f64_and_f64(
@@ -3795,6 +3920,7 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         indirect_offset: crate::BufferAddress,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.holds.push(buffer.release.clone());
         self.inner
             .draw_indirect_with_f64(&buffer.inner, indirect_offset as f64);
     }
@@ -3805,6 +3931,7 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
         indirect_offset: crate::BufferAddress,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.holds.push(buffer.release.clone());
         self.inner
             .draw_indexed_indirect_with_f64(&buffer.inner, indirect_offset as f64);
     }
@@ -3813,18 +3940,21 @@ impl dispatch::RenderBundleEncoderInterface for WebRenderBundleEncoder {
     where
         Self: Sized,
     {
+        let mut encoder = self;
+        let holds = core::mem::take(&mut encoder.holds);
         let bundle = match desc.label {
             Some(label) => {
                 let mapped_desc = webgpu_sys::GpuRenderBundleDescriptor::new();
                 mapped_desc.set_label(label);
-                self.inner.finish_with_descriptor(&mapped_desc)
+                encoder.inner.finish_with_descriptor(&mapped_desc)
             }
-            None => self.inner.finish(),
+            None => encoder.inner.finish(),
         };
 
         WebRenderBundle {
             inner: bundle,
             ident: crate::cmp::Identifier::create(),
+            holds: Rc::new(holds),
         }
         .into()
     }
@@ -3925,6 +4055,7 @@ impl dispatch::SurfaceInterface for WebSurface {
         let web_surface_texture = WebTexture {
             inner: surface_texture,
             ident: crate::cmp::Identifier::create(),
+            release: None,
         };
 
         (
