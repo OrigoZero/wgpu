@@ -272,6 +272,46 @@ impl Device {
         ComputePipeline { inner: pipeline }
     }
 
+    /// Creates a [`RenderPipeline`], resolving once the implementation has finished
+    /// compiling it.
+    ///
+    /// On the WebGPU backend this is `GPUDevice.createRenderPipelineAsync`: the
+    /// browser compiles the pipeline in its GPU process and the returned future
+    /// resolves when it is ready, so the calling thread never blocks on the
+    /// compile. On the native backends the pipeline is compiled by the driver
+    /// inside this call, on the calling thread, and the future is already
+    /// resolved when it returns — the natural way to spread compiles is to make
+    /// this call from worker threads, which [`Device`] permits.
+    ///
+    /// A pipeline that cannot be created is reported through the future's
+    /// [`Err`] rather than through the device's error scopes or uncaptured-error
+    /// handler, which is how [`Device::create_render_pipeline`] reports one.
+    ///
+    /// Corresponds to [WebGPU `GPUDevice.createRenderPipelineAsync()`](
+    /// https://gpuweb.github.io/gpuweb/#dom-gpudevice-createrenderpipelineasync).
+    pub fn create_render_pipeline_async(
+        &self,
+        desc: &RenderPipelineDescriptor<'_>,
+    ) -> impl Future<Output = Result<RenderPipeline, PipelineCreationError>> + WasmNotSend + 'static
+    {
+        let pipeline = self.inner.create_render_pipeline_async(desc);
+        async move { pipeline.await.map(|inner| RenderPipeline { inner }) }
+    }
+
+    /// Creates a [`ComputePipeline`], resolving once the implementation has
+    /// finished compiling it. See [`Device::create_render_pipeline_async`].
+    ///
+    /// Corresponds to [WebGPU `GPUDevice.createComputePipelineAsync()`](
+    /// https://gpuweb.github.io/gpuweb/#dom-gpudevice-createcomputepipelineasync).
+    pub fn create_compute_pipeline_async(
+        &self,
+        desc: &ComputePipelineDescriptor<'_>,
+    ) -> impl Future<Output = Result<ComputePipeline, PipelineCreationError>> + WasmNotSend + 'static
+    {
+        let pipeline = self.inner.create_compute_pipeline_async(desc);
+        async move { pipeline.await.map(|inner| ComputePipeline { inner }) }
+    }
+
     /// Creates a [`Buffer`].
     #[must_use]
     pub fn create_buffer(&self, desc: &BufferDescriptor<'_>) -> Buffer {
@@ -758,6 +798,31 @@ impl From<wgc::instance::RequestDeviceError> for RequestDeviceError {
 /// It must be a function with this signature.
 pub trait UncapturedErrorHandler: Fn(Error) + Send + Sync + 'static {}
 impl<T> UncapturedErrorHandler for T where T: Fn(Error) + Send + Sync + 'static {}
+
+/// Why an asynchronous pipeline creation ([`Device::create_render_pipeline_async`],
+/// [`Device::create_compute_pipeline_async`]) produced no pipeline: the
+/// implementation's own message for the validation or internal failure.
+#[derive(Debug, Clone)]
+pub struct PipelineCreationError {
+    pub(crate) message: String,
+}
+#[cfg(send_sync)]
+static_assertions::assert_impl_all!(PipelineCreationError: Send, Sync);
+
+impl PipelineCreationError {
+    /// The implementation's message for the failure.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for PipelineCreationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl error::Error for PipelineCreationError {}
 
 /// Kinds of [`Error`]s a [`Device::push_error_scope()`] may be configured to catch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd)]

@@ -52,6 +52,8 @@ macro_rules! trait_alias {
 trait_alias!(RequestAdapterFuture: Future<Output = Result<DispatchAdapter, wgt::RequestAdapterError>> + WasmNotSend + 'static);
 trait_alias!(RequestDeviceFuture: Future<Output = Result<(DispatchDevice, DispatchQueue), crate::RequestDeviceError>> + WasmNotSend + 'static);
 trait_alias!(PopErrorScopeFuture: Future<Output = Option<crate::Error>> + WasmNotSend + 'static);
+trait_alias!(CreateRenderPipelineFuture: Future<Output = Result<DispatchRenderPipeline, crate::PipelineCreationError>> + WasmNotSend + 'static);
+trait_alias!(CreateComputePipelineFuture: Future<Output = Result<DispatchComputePipeline, crate::PipelineCreationError>> + WasmNotSend + 'static);
 trait_alias!(ShaderCompilationInfoFuture: Future<Output = crate::CompilationInfo> + WasmNotSend + 'static);
 trait_alias!(EnumerateAdapterFuture: Future<Output = Vec<DispatchAdapter>> + WasmNotSend + 'static);
 
@@ -176,6 +178,14 @@ pub trait DeviceInterface: CommonTraits {
         &self,
         desc: &crate::ComputePipelineDescriptor<'_>,
     ) -> DispatchComputePipeline;
+    fn create_render_pipeline_async(
+        &self,
+        desc: &crate::RenderPipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn CreateRenderPipelineFuture>>;
+    fn create_compute_pipeline_async(
+        &self,
+        desc: &crate::ComputePipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn CreateComputePipelineFuture>>;
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,
