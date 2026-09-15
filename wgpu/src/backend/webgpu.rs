@@ -1238,14 +1238,20 @@ where
 
     let rc_callback_clone1 = rc_callback.clone();
     let rc_callback_clone2 = rc_callback.clone();
-    let closure_success = wasm_bindgen::closure::Closure::once(move |_| {
+    // `Closure::once_assert_unwind_safe` rather than `Closure::once`: built with
+    // `-C panic=unwind`, wasm-bindgen catches a panic raised inside a callback
+    // the browser invoked instead of letting it trap, and it asks the
+    // callback's captures to be unwind-safe first. Both closures below take the
+    // shared cell, call the caller's `callback` once and drop what carried it,
+    // which a panic crossing one leaves the way an early return does.
+    let closure_success = wasm_bindgen::closure::Closure::once_assert_unwind_safe(move |_| {
         let (success_closure, rejection_closure, callback) =
             rc_callback_clone1.borrow_mut().take().unwrap();
         callback(success_value);
         // drop the closures, including ourselves, which will free any captured memory.
         drop((success_closure, rejection_closure));
     });
-    let closure_rejected = wasm_bindgen::closure::Closure::once(move |_| {
+    let closure_rejected = wasm_bindgen::closure::Closure::once_assert_unwind_safe(move |_| {
         let (success_closure, rejection_closure, callback) =
             rc_callback_clone2.borrow_mut().take().unwrap();
         callback(failure_value);
@@ -2682,7 +2688,10 @@ impl dispatch::DeviceInterface for WebDevice {
     }
 
     fn set_device_lost_callback(&self, device_lost_callback: dispatch::BoxDeviceLostCallback) {
-        let closure = Closure::once(move |info: JsValue| {
+        // `Closure::once_assert_unwind_safe` — see `register_then_closures`. The
+        // callback is the caller's own device-lost handler, handed the reason
+        // and the message the browser reported.
+        let closure = Closure::once_assert_unwind_safe(move |info: JsValue| {
             let info = info.dyn_into::<webgpu_sys::GpuDeviceLostInfo>().unwrap();
             device_lost_callback(
                 match info.reason() {
@@ -2702,10 +2711,14 @@ impl dispatch::DeviceInterface for WebDevice {
     }
 
     fn on_uncaptured_error(&self, handler: Arc<dyn crate::UncapturedErrorHandler>) {
-        let f = Closure::wrap(Box::new(move |event: webgpu_sys::GpuUncapturedErrorEvent| {
-            let error = crate::Error::from_js(event.error().value_of());
-            handler(error);
-        }) as Box<dyn FnMut(_)>);
+        // `Closure::wrap_assert_unwind_safe` — see `register_then_closures`. The
+        // handler is the caller's own uncaptured-error handler.
+        let f = Closure::wrap_assert_unwind_safe(Box::new(
+            move |event: webgpu_sys::GpuUncapturedErrorEvent| {
+                let error = crate::Error::from_js(event.error().value_of());
+                handler(error);
+            },
+        ) as Box<dyn FnMut(_)>);
         self.inner
             .set_onuncapturederror(Some(f.as_ref().unchecked_ref()));
         // Release memory management of this closure from Rust to the JS GC.
