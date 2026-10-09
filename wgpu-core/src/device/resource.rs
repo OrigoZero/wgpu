@@ -5325,6 +5325,7 @@ impl Device {
                             | wgt::TextureFormatFeatureFlags::STORAGE_READ_WRITE,
                     ),
                     view_formats: hal_view_formats,
+                    pre_transform: config.pre_transform,
                 };
 
                 if let Err(error) = validate_surface_configuration(

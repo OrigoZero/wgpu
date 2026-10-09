@@ -119,6 +119,11 @@ pub enum ConfigureSurfaceError {
         requested: wgt::TextureUses,
         available: wgt::TextureUses,
     },
+    #[error("Requested pre-transform {requested:?} is not in the list of supported transforms: {available:?}")]
+    UnsupportedTransform {
+        requested: wgt::SurfaceTransform,
+        available: Vec<wgt::SurfaceTransform>,
+    },
 }
 
 impl From<WaitIdleError> for ConfigureSurfaceError {
@@ -147,7 +152,8 @@ impl WebGpuError for ConfigureSurfaceError {
             | Self::UnsupportedColorSpace { .. }
             | Self::UnsupportedPresentMode { .. }
             | Self::UnsupportedAlphaMode { .. }
-            | Self::UnsupportedUsage { .. } => ErrorType::Validation,
+            | Self::UnsupportedUsage { .. }
+            | Self::UnsupportedTransform { .. } => ErrorType::Validation,
         }
     }
 }

@@ -101,6 +101,7 @@ impl GPUCanvasContext {
         .map(Into::into)
         .collect(),
       desired_maximum_frame_latency: 2,
+      pre_transform: wgpu_types::SurfaceTransform::Identity,
     };
 
     let device = configuration.device;

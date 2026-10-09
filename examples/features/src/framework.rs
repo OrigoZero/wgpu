@@ -708,6 +708,7 @@ impl<E: Example + wgpu::WasmNotSendSync> From<ExampleTestParams<E>>
                         present_mode: wgpu::PresentMode::Fifo,
                         alpha_mode: wgpu::CompositeAlphaMode::Auto,
                         view_formats: vec![format],
+                        pre_transform: wgpu::SurfaceTransform::Identity,
                     },
                     &ctx.adapter,
                     &ctx.device,
