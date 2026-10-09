@@ -1306,6 +1306,8 @@ impl crate::Adapter for super::Adapter {
                     wgt::CompositeAlphaMode::PreMultiplied,
                 ],
             },
+            transforms: vec![wgt::SurfaceTransform::Identity],
+            current_transform: wgt::SurfaceTransform::Identity,
         })
     }
 

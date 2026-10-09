@@ -431,6 +431,8 @@ impl crate::Adapter for super::Adapter {
                 | wgt::TextureUses::STORAGE_READ_ONLY
                 | wgt::TextureUses::STORAGE_WRITE_ONLY
                 | wgt::TextureUses::STORAGE_READ_WRITE,
+            transforms: vec![wgt::SurfaceTransform::Identity],
+            current_transform: wgt::SurfaceTransform::Identity,
         })
     }
 

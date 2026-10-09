@@ -531,6 +531,54 @@ pub fn map_vk_composite_alpha(flags: vk::CompositeAlphaFlagsKHR) -> Vec<wgt::Com
     modes
 }
 
+/// The rotations among `flags`, with `Identity` always first: a swapchain has
+/// always been creatable with the identity transform, whatever the surface
+/// reports.
+pub fn map_vk_surface_transforms(
+    flags: vk::SurfaceTransformFlagsKHR,
+) -> Vec<wgt::SurfaceTransform> {
+    let mut transforms = vec![wgt::SurfaceTransform::Identity];
+    for (flag, transform) in [
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_90,
+            wgt::SurfaceTransform::Rotate90,
+        ),
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_180,
+            wgt::SurfaceTransform::Rotate180,
+        ),
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_270,
+            wgt::SurfaceTransform::Rotate270,
+        ),
+    ] {
+        if flags.contains(flag) {
+            transforms.push(transform);
+        }
+    }
+    transforms
+}
+
+/// The rotation `flag` states. A mirrored or inherited transform has no
+/// rotation to state and reads as `Identity`.
+pub fn map_vk_surface_transform(flag: vk::SurfaceTransformFlagsKHR) -> wgt::SurfaceTransform {
+    match flag {
+        vk::SurfaceTransformFlagsKHR::ROTATE_90 => wgt::SurfaceTransform::Rotate90,
+        vk::SurfaceTransformFlagsKHR::ROTATE_180 => wgt::SurfaceTransform::Rotate180,
+        vk::SurfaceTransformFlagsKHR::ROTATE_270 => wgt::SurfaceTransform::Rotate270,
+        _ => wgt::SurfaceTransform::Identity,
+    }
+}
+
+pub fn map_surface_transform(transform: wgt::SurfaceTransform) -> vk::SurfaceTransformFlagsKHR {
+    match transform {
+        wgt::SurfaceTransform::Identity => vk::SurfaceTransformFlagsKHR::IDENTITY,
+        wgt::SurfaceTransform::Rotate90 => vk::SurfaceTransformFlagsKHR::ROTATE_90,
+        wgt::SurfaceTransform::Rotate180 => vk::SurfaceTransformFlagsKHR::ROTATE_180,
+        wgt::SurfaceTransform::Rotate270 => vk::SurfaceTransformFlagsKHR::ROTATE_270,
+    }
+}
+
 pub fn map_buffer_usage(usage: wgt::BufferUses) -> vk::BufferUsageFlags {
     let mut flags = vk::BufferUsageFlags::empty();
     if usage.contains(wgt::BufferUses::COPY_SRC) {

@@ -62,6 +62,8 @@ impl Global {
                 present_modes: hal_caps.present_modes,
                 alpha_modes: hal_caps.composite_alpha_modes,
                 usages,
+                transforms: hal_caps.transforms,
+                current_transform: hal_caps.current_transform,
             })
         })
     }

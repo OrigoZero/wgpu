@@ -5050,6 +5050,12 @@ impl Device {
                     available: caps.usage,
                 });
             }
+            if !caps.transforms.contains(&config.pre_transform) {
+                return Err(E::UnsupportedTransform {
+                    requested: config.pre_transform,
+                    available: caps.transforms.clone(),
+                });
+            }
             if width == 0 || height == 0 {
                 return Err(E::ZeroArea);
             }
@@ -5118,6 +5124,7 @@ impl Device {
                             | wgt::TextureFormatFeatureFlags::STORAGE_READ_WRITE,
                     ),
                     view_formats: hal_view_formats,
+                    pre_transform: config.pre_transform,
                 };
 
                 if let Err(error) = validate_surface_configuration(

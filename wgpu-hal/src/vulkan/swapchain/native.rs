@@ -148,6 +148,8 @@ impl Surface for NativeSurface {
                 .flat_map(conv::map_vk_present_mode)
                 .collect(),
             composite_alpha_modes: conv::map_vk_composite_alpha(caps.supported_composite_alpha),
+            transforms: conv::map_vk_surface_transforms(caps.supported_transforms),
+            current_transform: conv::map_vk_surface_transform(caps.current_transform),
         })
     }
 
@@ -199,7 +201,7 @@ impl Surface for NativeSurface {
             .image_array_layers(config.extent.depth_or_array_layers)
             .image_usage(conv::map_texture_usage(config.usage))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .pre_transform(conv::map_surface_transform(config.pre_transform))
             .composite_alpha(conv::map_composite_alpha_mode(config.composite_alpha_mode))
             .present_mode(conv::map_present_mode(config.present_mode))
             .clipped(true)
@@ -273,6 +275,7 @@ impl Surface for NativeSurface {
             next_acquire_index: 0,
             present_semaphores,
             next_present_time: None,
+            presented_suboptimal: false,
         }))
     }
 
@@ -334,6 +337,11 @@ pub(crate) struct NativeSwapchain {
     /// This must only be set if [`wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING`] is enabled, and
     /// so the VK_GOOGLE_display_timing extension is present.
     next_present_time: Option<vk::PresentTimeGOOGLE>,
+
+    /// Whether a present of this pre-transformed swapchain since the last
+    /// acquire answered `VK_SUBOPTIMAL_KHR`. Presenting has no suboptimal
+    /// answer to give, so the next acquire gives it.
+    presented_suboptimal: bool,
 }
 
 impl Swapchain for NativeSwapchain {
@@ -436,12 +444,12 @@ impl Swapchain for NativeSwapchain {
                 self.fence,
             )
         } {
-            // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
-            // See the comment in `Queue::present`.
-            #[cfg(target_os = "android")]
-            Ok((index, _)) => (index, false),
-            #[cfg(not(target_os = "android"))]
-            Ok(pair) => pair,
+            // See `NativeSwapchain::reports_suboptimal`.
+            Ok((index, suboptimal)) => (
+                index,
+                (suboptimal && self.reports_suboptimal())
+                    | core::mem::take(&mut self.presented_suboptimal),
+            ),
             Err(error) => {
                 return match error {
                     vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
@@ -588,13 +596,13 @@ impl Swapchain for NativeSwapchain {
                 }
             })?
         };
-        if suboptimal {
-            // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
-            // On Android 10+, libvulkan's `vkQueuePresentKHR` implementation returns `VK_SUBOPTIMAL_KHR` if not doing pre-rotation
-            // (i.e `VkSwapchainCreateInfoKHR::preTransform` not being equal to the current device orientation).
-            // This is always the case when the device orientation is anything other than the identity one, as we unconditionally use `VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR`.
-            #[cfg(not(target_os = "android"))]
+        if suboptimal && self.reports_suboptimal() {
             log::debug!("Suboptimal present of frame {}", texture.index);
+            // A pre-transformed swapchain goes suboptimal when the surface's
+            // transform changes, which on Android only the present reports.
+            if self.config.pre_transform != wgt::SurfaceTransform::Identity {
+                self.presented_suboptimal = true;
+            }
         }
         Ok(())
     }
@@ -611,6 +619,21 @@ impl Swapchain for NativeSwapchain {
 impl NativeSwapchain {
     pub(crate) fn as_raw(&self) -> vk::SwapchainKHR {
         self.raw
+    }
+
+    /// Whether a `VK_SUBOPTIMAL_KHR` from this swapchain is reported as
+    /// suboptimal.
+    ///
+    /// On Android 10+, libvulkan answers `VK_SUBOPTIMAL_KHR` on every acquire
+    /// and present whose swapchain's `preTransform` differs from the surface's
+    /// current transform. A swapchain configured with the identity transform
+    /// presents through the compositor's rotation, which no reconfiguration of
+    /// it changes, so there it reads as success. A swapchain configured with
+    /// another transform states that its application pre-rotates, and the
+    /// mismatch is the signal to configure it with the surface's current
+    /// transform.
+    fn reports_suboptimal(&self) -> bool {
+        !cfg!(target_os = "android") || self.config.pre_transform != wgt::SurfaceTransform::Identity
     }
 
     pub fn set_next_present_time(&mut self, present_timing: vk::PresentTimeGOOGLE) {

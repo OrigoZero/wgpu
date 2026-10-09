@@ -131,6 +131,41 @@ pub enum CompositeAlphaMode {
     Inherit = 4,
 }
 
+/// A rotation of a surface's images on their way to the display, clockwise.
+///
+/// A surface on a display mounted in one orientation and shown in another (a
+/// phone held in landscape) reports the rotation from the display's native
+/// orientation to the one it is shown in as
+/// [`SurfaceCapabilities::current_transform`]. An application that draws each
+/// image already rotated by that amount states it as
+/// [`SurfaceConfiguration::pre_transform`], and the presentation engine then
+/// shows the image as it is; with [`SurfaceTransform::Identity`] the
+/// presentation engine rotates every image itself.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum SurfaceTransform {
+    /// The image is shown as it is.
+    #[default]
+    Identity = 0,
+    /// The image is rotated 90 degrees clockwise.
+    Rotate90 = 1,
+    /// The image is rotated 180 degrees.
+    Rotate180 = 2,
+    /// The image is rotated 270 degrees clockwise.
+    Rotate270 = 3,
+}
+
+impl SurfaceTransform {
+    /// Whether the transform exchanges an image's width and height: true for
+    /// the quarter turns.
+    #[must_use]
+    pub const fn swaps_extent(self) -> bool {
+        matches!(self, Self::Rotate90 | Self::Rotate270)
+    }
+}
+
 /// Defines the capabilities of a given surface and adapter.
 #[derive(Debug)]
 pub struct SurfaceCapabilities {
@@ -150,6 +185,15 @@ pub struct SurfaceCapabilities {
     ///
     /// The usage [`TextureUsages::RENDER_ATTACHMENT`] is guaranteed.
     pub usages: TextureUsages,
+    /// The transforms [`SurfaceConfiguration::pre_transform`] may state.
+    ///
+    /// Always holds [`SurfaceTransform::Identity`].
+    pub transforms: Vec<SurfaceTransform>,
+    /// The rotation from the display's native orientation to the one the
+    /// surface is shown in now. Images presented with this as their
+    /// [`SurfaceConfiguration::pre_transform`] reach the display without the
+    /// presentation engine rotating them.
+    pub current_transform: SurfaceTransform,
 }
 
 impl Default for SurfaceCapabilities {
@@ -159,6 +203,8 @@ impl Default for SurfaceCapabilities {
             present_modes: Vec::new(),
             alpha_modes: vec![CompositeAlphaMode::Opaque],
             usages: TextureUsages::RENDER_ATTACHMENT,
+            transforms: vec![SurfaceTransform::Identity],
+            current_transform: SurfaceTransform::Identity,
         }
     }
 }
@@ -237,6 +283,24 @@ pub struct SurfaceConfiguration<V> {
     ///
     /// Note: currently, only the srgb-ness is allowed to change. (ex: `Rgba8Unorm` texture + `Rgba8UnormSrgb` view)
     pub view_formats: V,
+    /// The rotation each presented image is already drawn with. Must be one of
+    /// [`SurfaceCapabilities::transforms`].
+    ///
+    /// With [`SurfaceTransform::Identity`] the images are drawn the way the
+    /// surface is shown and `width` and `height` are the surface's size; the
+    /// presentation engine rotates each image when the surface is shown in
+    /// another orientation than the display's native one. With
+    /// [`SurfaceCapabilities::current_transform`] the application draws each
+    /// image rotated by it, `width` and `height` are the image's own size (the
+    /// surface's size with the two exchanged for a quarter turn), and the
+    /// image is shown as it is.
+    ///
+    /// On Vulkan on Android a swapchain whose transform differs from the
+    /// surface's current one reports [`SurfaceStatus::Suboptimal`] when it
+    /// states a transform other than [`SurfaceTransform::Identity`]; one
+    /// stating `Identity` presents through the presentation engine's rotation
+    /// without reporting it.
+    pub pre_transform: SurfaceTransform,
 }
 
 impl<V: Clone> SurfaceConfiguration<V> {
@@ -251,6 +315,7 @@ impl<V: Clone> SurfaceConfiguration<V> {
             desired_maximum_frame_latency: self.desired_maximum_frame_latency,
             alpha_mode: self.alpha_mode,
             view_formats: fun(self.view_formats.clone()),
+            pre_transform: self.pre_transform,
         }
     }
 }
