@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### New Features
+
+#### General
+
+- `SurfaceCapabilities` states the surface's `current_transform` and the `transforms` a configuration may state, and `SurfaceConfiguration::pre_transform` states the rotation each presented image is already drawn with. On Vulkan it is the swapchain's `preTransform`, so an application that draws its images rotated by the current transform is presented without the compositor rotating each one (Android pre-rotation). Every other backend offers `Identity` alone.
+
 ## v29.0.1 (2026-03-26)
 
 This release includes `wgpu-core`, `wgpu-hal` and `wgpu-types` version `29.0.1`. All other crates remain at their previous versions.

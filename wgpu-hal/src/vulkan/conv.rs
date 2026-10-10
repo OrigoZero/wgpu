@@ -1083,3 +1083,67 @@ pub fn map_acceleration_structure_usage_to_barrier(
 
     (stages, access)
 }
+
+#[cfg(test)]
+mod surface_transform_tests {
+    use super::*;
+
+    #[test]
+    fn every_rotation_round_trips_through_its_flag() {
+        for transform in [
+            wgt::SurfaceTransform::Identity,
+            wgt::SurfaceTransform::Rotate90,
+            wgt::SurfaceTransform::Rotate180,
+            wgt::SurfaceTransform::Rotate270,
+        ] {
+            assert_eq!(
+                map_vk_surface_transform(map_surface_transform(transform)),
+                transform
+            );
+        }
+    }
+
+    #[test]
+    fn the_supported_transforms_hold_identity_and_the_offered_rotations() {
+        assert_eq!(
+            map_vk_surface_transforms(vk::SurfaceTransformFlagsKHR::empty()),
+            [wgt::SurfaceTransform::Identity]
+        );
+        assert_eq!(
+            map_vk_surface_transforms(
+                vk::SurfaceTransformFlagsKHR::IDENTITY
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_90
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_180
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_270
+                    | vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR
+            ),
+            [
+                wgt::SurfaceTransform::Identity,
+                wgt::SurfaceTransform::Rotate90,
+                wgt::SurfaceTransform::Rotate180,
+                wgt::SurfaceTransform::Rotate270,
+            ]
+        );
+        assert_eq!(
+            map_vk_surface_transforms(vk::SurfaceTransformFlagsKHR::ROTATE_270),
+            [
+                wgt::SurfaceTransform::Identity,
+                wgt::SurfaceTransform::Rotate270
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mirrored_or_inherited_transform_reads_as_identity() {
+        for flag in [
+            vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR,
+            vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR_ROTATE_90,
+            vk::SurfaceTransformFlagsKHR::INHERIT,
+        ] {
+            assert_eq!(
+                map_vk_surface_transform(flag),
+                wgt::SurfaceTransform::Identity
+            );
+        }
+    }
+}

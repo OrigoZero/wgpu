@@ -166,6 +166,19 @@ impl SurfaceTransform {
     }
 }
 
+#[cfg(test)]
+mod surface_transform_tests {
+    use super::SurfaceTransform;
+
+    #[test]
+    fn only_the_quarter_turns_swap_the_extent() {
+        assert!(!SurfaceTransform::Identity.swaps_extent());
+        assert!(SurfaceTransform::Rotate90.swaps_extent());
+        assert!(!SurfaceTransform::Rotate180.swaps_extent());
+        assert!(SurfaceTransform::Rotate270.swaps_extent());
+    }
+}
+
 /// Defines the capabilities of a given surface and adapter.
 #[derive(Debug)]
 pub struct SurfaceCapabilities {
