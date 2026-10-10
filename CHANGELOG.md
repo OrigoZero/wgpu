@@ -46,7 +46,7 @@ Bottom level categories:
 
 #### General
 
-- `SurfaceCapabilities` states the surface's `current_transform` and the `transforms` a configuration may state, and `SurfaceConfiguration::pre_transform` states the rotation each presented image is already drawn with. On Vulkan it is the swapchain's `preTransform`, so an application that draws its images rotated by the current transform is presented without the compositor rotating each one (Android pre-rotation). Every other backend offers `Identity` alone.
+- `SurfaceCapabilities` states the surface's `current_transform` and the `transforms` a configuration may state, and `SurfaceConfiguration::pre_transform` states the rotation each presented image is already drawn with. On Vulkan it is the swapchain's `preTransform`, so an application that draws its images rotated by the current transform is presented without the compositor rotating each one (Android pre-rotation). Every other backend offers `Identity` alone. On Vulkan on Android a surface reports `Suboptimal` when its current transform changed since it was configured, a half turn of the display included.
 
 ## v29.0.1 (2026-03-26)
 

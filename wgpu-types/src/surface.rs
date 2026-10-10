@@ -308,11 +308,9 @@ pub struct SurfaceConfiguration<V> {
     /// surface's size with the two exchanged for a quarter turn), and the
     /// image is shown as it is.
     ///
-    /// On Vulkan on Android a swapchain whose transform differs from the
-    /// surface's current one reports [`SurfaceStatus::Suboptimal`] when it
-    /// states a transform other than [`SurfaceTransform::Identity`]; one
-    /// stating `Identity` presents through the presentation engine's rotation
-    /// without reporting it.
+    /// On Vulkan on Android a surface reports [`SurfaceStatus::Suboptimal`]
+    /// when its current transform has changed since it was configured, a half
+    /// turn of the display included, which keeps the surface's size.
     pub pre_transform: SurfaceTransform,
 }
 

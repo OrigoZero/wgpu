@@ -242,6 +242,12 @@ impl Surface for NativeSurface {
         let images = unsafe { functor.get_swapchain_images(raw) }
             .map_err(crate::vulkan::map_host_device_oom_err)?;
 
+        let created_transform = if cfg!(target_os = "android") {
+            surface_current_transform(&self.functor, &device.shared, self.raw)
+        } else {
+            None
+        };
+
         let fence = unsafe {
             device
                 .shared
@@ -275,6 +281,9 @@ impl Surface for NativeSurface {
             next_acquire_index: 0,
             present_semaphores,
             next_present_time: None,
+            surface: self.raw,
+            surface_functor: self.functor.clone(),
+            created_transform,
             presented_suboptimal: false,
         }))
     }
@@ -338,9 +347,17 @@ pub(crate) struct NativeSwapchain {
     /// so the VK_GOOGLE_display_timing extension is present.
     next_present_time: Option<vk::PresentTimeGOOGLE>,
 
-    /// Whether a present of this pre-transformed swapchain since the last
-    /// acquire answered `VK_SUBOPTIMAL_KHR`. Presenting has no suboptimal
-    /// answer to give, so the next acquire gives it.
+    /// The surface this swapchain presents to.
+    surface: vk::SurfaceKHR,
+    surface_functor: khr::surface::Instance,
+
+    /// On Android, the surface's current transform when this swapchain was
+    /// created. See [`NativeSwapchain::reports_suboptimal`].
+    created_transform: Option<vk::SurfaceTransformFlagsKHR>,
+
+    /// Whether a present on Android since the last acquire answered
+    /// `VK_SUBOPTIMAL_KHR` and was reported as suboptimal. Presenting has no
+    /// suboptimal answer to give, so the next acquire gives it.
     presented_suboptimal: bool,
 }
 
@@ -598,9 +615,7 @@ impl Swapchain for NativeSwapchain {
         };
         if suboptimal && self.reports_suboptimal() {
             log::debug!("Suboptimal present of frame {}", texture.index);
-            // A pre-transformed swapchain goes suboptimal when the surface's
-            // transform changes, which on Android only the present reports.
-            if self.config.pre_transform != wgt::SurfaceTransform::Identity {
+            if cfg!(target_os = "android") {
                 self.presented_suboptimal = true;
             }
         }
@@ -626,14 +641,19 @@ impl NativeSwapchain {
     ///
     /// On Android 10+, libvulkan answers `VK_SUBOPTIMAL_KHR` on every acquire
     /// and present whose swapchain's `preTransform` differs from the surface's
-    /// current transform. A swapchain configured with the identity transform
-    /// presents through the compositor's rotation, which no reconfiguration of
-    /// it changes, so there it reads as success. A swapchain configured with
-    /// another transform states that its application pre-rotates, and the
-    /// mismatch is the signal to configure it with the surface's current
-    /// transform.
+    /// current transform, so a swapchain that is not pre-rotated answers it on
+    /// every frame the display is turned. There it is reported when the
+    /// surface's current transform differs from the one it had when the
+    /// swapchain was created: the display turned since, and a configuration
+    /// made now would state another transform. A display turned by half
+    /// (portrait to upside down) keeps the surface's size, and this is the one
+    /// signal of that turn.
     fn reports_suboptimal(&self) -> bool {
-        !cfg!(target_os = "android") || self.config.pre_transform != wgt::SurfaceTransform::Identity
+        if !cfg!(target_os = "android") {
+            return true;
+        }
+        let current = surface_current_transform(&self.surface_functor, &self.device, self.surface);
+        current.is_some() && current != self.created_transform
     }
 
     pub fn set_next_present_time(&mut self, present_timing: vk::PresentTimeGOOGLE) {
@@ -897,6 +917,19 @@ impl SurfaceTextureMetadata for NativeSurfaceTextureMetadata {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// The current transform of `surface`, or `None` when the surface's
+/// capabilities cannot be read.
+fn surface_current_transform(
+    functor: &khr::surface::Instance,
+    device: &DeviceShared,
+    surface: vk::SurfaceKHR,
+) -> Option<vk::SurfaceTransformFlagsKHR> {
+    profiling::scope!("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    unsafe { functor.get_physical_device_surface_capabilities(device.physical_device, surface) }
+        .ok()
+        .map(|caps| caps.current_transform)
 }
 
 struct NativeSwapchainSubmissionSemaphoreGuard<'a> {
