@@ -599,6 +599,54 @@ pub fn map_vk_composite_alpha(flags: vk::CompositeAlphaFlagsKHR) -> Vec<wgt::Com
     modes
 }
 
+/// The rotations among `flags`, with `Identity` always first: a swapchain has
+/// always been creatable with the identity transform, whatever the surface
+/// reports.
+pub fn map_vk_surface_transforms(
+    flags: vk::SurfaceTransformFlagsKHR,
+) -> Vec<wgt::SurfaceTransform> {
+    let mut transforms = vec![wgt::SurfaceTransform::Identity];
+    for (flag, transform) in [
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_90,
+            wgt::SurfaceTransform::Rotate90,
+        ),
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_180,
+            wgt::SurfaceTransform::Rotate180,
+        ),
+        (
+            vk::SurfaceTransformFlagsKHR::ROTATE_270,
+            wgt::SurfaceTransform::Rotate270,
+        ),
+    ] {
+        if flags.contains(flag) {
+            transforms.push(transform);
+        }
+    }
+    transforms
+}
+
+/// The rotation `flag` states. A mirrored or inherited transform has no
+/// rotation to state and reads as `Identity`.
+pub fn map_vk_surface_transform(flag: vk::SurfaceTransformFlagsKHR) -> wgt::SurfaceTransform {
+    match flag {
+        vk::SurfaceTransformFlagsKHR::ROTATE_90 => wgt::SurfaceTransform::Rotate90,
+        vk::SurfaceTransformFlagsKHR::ROTATE_180 => wgt::SurfaceTransform::Rotate180,
+        vk::SurfaceTransformFlagsKHR::ROTATE_270 => wgt::SurfaceTransform::Rotate270,
+        _ => wgt::SurfaceTransform::Identity,
+    }
+}
+
+pub fn map_surface_transform(transform: wgt::SurfaceTransform) -> vk::SurfaceTransformFlagsKHR {
+    match transform {
+        wgt::SurfaceTransform::Identity => vk::SurfaceTransformFlagsKHR::IDENTITY,
+        wgt::SurfaceTransform::Rotate90 => vk::SurfaceTransformFlagsKHR::ROTATE_90,
+        wgt::SurfaceTransform::Rotate180 => vk::SurfaceTransformFlagsKHR::ROTATE_180,
+        wgt::SurfaceTransform::Rotate270 => vk::SurfaceTransformFlagsKHR::ROTATE_270,
+    }
+}
+
 pub fn map_buffer_usage(usage: wgt::BufferUses) -> vk::BufferUsageFlags {
     let mut flags = vk::BufferUsageFlags::empty();
     if usage.contains(wgt::BufferUses::COPY_SRC) {
@@ -1386,5 +1434,69 @@ mod tests {
             vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
                 | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
         );
+    }
+}
+
+#[cfg(test)]
+mod surface_transform_tests {
+    use super::*;
+
+    #[test]
+    fn every_rotation_round_trips_through_its_flag() {
+        for transform in [
+            wgt::SurfaceTransform::Identity,
+            wgt::SurfaceTransform::Rotate90,
+            wgt::SurfaceTransform::Rotate180,
+            wgt::SurfaceTransform::Rotate270,
+        ] {
+            assert_eq!(
+                map_vk_surface_transform(map_surface_transform(transform)),
+                transform
+            );
+        }
+    }
+
+    #[test]
+    fn the_supported_transforms_hold_identity_and_the_offered_rotations() {
+        assert_eq!(
+            map_vk_surface_transforms(vk::SurfaceTransformFlagsKHR::empty()),
+            [wgt::SurfaceTransform::Identity]
+        );
+        assert_eq!(
+            map_vk_surface_transforms(
+                vk::SurfaceTransformFlagsKHR::IDENTITY
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_90
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_180
+                    | vk::SurfaceTransformFlagsKHR::ROTATE_270
+                    | vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR
+            ),
+            [
+                wgt::SurfaceTransform::Identity,
+                wgt::SurfaceTransform::Rotate90,
+                wgt::SurfaceTransform::Rotate180,
+                wgt::SurfaceTransform::Rotate270,
+            ]
+        );
+        assert_eq!(
+            map_vk_surface_transforms(vk::SurfaceTransformFlagsKHR::ROTATE_270),
+            [
+                wgt::SurfaceTransform::Identity,
+                wgt::SurfaceTransform::Rotate270
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mirrored_or_inherited_transform_reads_as_identity() {
+        for flag in [
+            vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR,
+            vk::SurfaceTransformFlagsKHR::HORIZONTAL_MIRROR_ROTATE_90,
+            vk::SurfaceTransformFlagsKHR::INHERIT,
+        ] {
+            assert_eq!(
+                map_vk_surface_transform(flag),
+                wgt::SurfaceTransform::Identity
+            );
+        }
     }
 }

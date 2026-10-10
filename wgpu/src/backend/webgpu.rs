@@ -4417,6 +4417,8 @@ impl dispatch::SurfaceInterface for WebSurface {
             ],
             // Statically set to RENDER_ATTACHMENT for now. See https://gpuweb.github.io/gpuweb/#dom-gpucanvasconfiguration-usage
             usages: wgt::TextureUsages::RENDER_ATTACHMENT,
+            transforms: vec![wgt::SurfaceTransform::Identity],
+            current_transform: wgt::SurfaceTransform::Identity,
         }
     }
 
@@ -4467,6 +4469,9 @@ impl dispatch::SurfaceInterface for WebSurface {
             config.alpha_mode
         {
             panic!("Only Opaque/Auto or PreMultiplied alpha mode are supported on web");
+        }
+        if config.pre_transform != wgt::SurfaceTransform::Identity {
+            panic!("Only the Identity pre-transform is supported on web");
         }
         let alpha_mode = match config.alpha_mode {
             wgt::CompositeAlphaMode::PreMultiplied => webgpu_sys::GpuCanvasAlphaMode::Premultiplied,

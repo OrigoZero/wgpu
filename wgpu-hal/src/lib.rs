@@ -2251,6 +2251,15 @@ pub struct SurfaceCapabilities {
     ///
     /// Must be at least one.
     pub composite_alpha_modes: Vec<wgt::CompositeAlphaMode>,
+
+    /// Transforms a configuration may state as its `pre_transform`.
+    ///
+    /// Must hold `wgt::SurfaceTransform::Identity`.
+    pub transforms: Vec<wgt::SurfaceTransform>,
+
+    /// The rotation from the display's native orientation to the one the
+    /// surface is shown in now.
+    pub current_transform: wgt::SurfaceTransform,
 }
 
 impl SurfaceCapabilities {
@@ -2816,6 +2825,9 @@ pub struct SurfaceConfiguration {
     /// Allows views of swapchain texture to have a different format
     /// than the texture does.
     pub view_formats: Vec<wgt::TextureFormat>,
+    /// The rotation each presented image is already drawn with. Must be in
+    /// `SurfaceCapabilities::transforms`.
+    pub pre_transform: wgt::SurfaceTransform,
 }
 
 #[derive(Debug, Clone)]

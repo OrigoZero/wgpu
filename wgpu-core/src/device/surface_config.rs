@@ -178,6 +178,12 @@ pub(crate) fn validate_surface_configuration(
             available: caps.usage,
         });
     }
+    if !caps.transforms.contains(&config.pre_transform) {
+        return Err(E::UnsupportedTransform {
+            requested: config.pre_transform,
+            available: caps.transforms.clone(),
+        });
+    }
     if width == 0 || height == 0 {
         return Err(E::ZeroArea);
     }
@@ -199,6 +205,8 @@ mod surface_configuration_tests {
             usage: wgt::TextureUses::COLOR_TARGET,
             present_modes: vec![wgt::PresentMode::Fifo],
             composite_alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
+            transforms: vec![wgt::SurfaceTransform::Identity],
+            current_transform: wgt::SurfaceTransform::Identity,
         }
     }
 
@@ -219,6 +227,7 @@ mod surface_configuration_tests {
             },
             usage: wgt::TextureUses::COLOR_TARGET,
             view_formats: Vec::new(),
+            pre_transform: wgt::SurfaceTransform::Identity,
         }
     }
 
@@ -249,6 +258,30 @@ mod surface_configuration_tests {
             config.color_space,
             wgt::SurfaceColorSpace::ExtendedSrgbLinear
         );
+    }
+
+    /// A pre-transform the surface offers is accepted, and one it does not
+    /// offer is refused naming the ones it does.
+    #[test]
+    fn pre_transform_must_be_offered() {
+        let mut caps = caps(vec![format_caps(
+            wgt::TextureFormat::Rgba8Unorm,
+            wgt::SurfaceColorSpaces::SRGB,
+        )]);
+        let mut config = config(wgt::TextureFormat::Rgba8Unorm, wgt::SurfaceColorSpace::Auto);
+        config.pre_transform = wgt::SurfaceTransform::Rotate90;
+        match validate_surface_configuration(&mut config, &caps, 4096) {
+            Err(ConfigureSurfaceError::UnsupportedTransform {
+                requested,
+                available,
+            }) => {
+                assert_eq!(requested, wgt::SurfaceTransform::Rotate90);
+                assert_eq!(available, vec![wgt::SurfaceTransform::Identity]);
+            }
+            other => panic!("expected UnsupportedTransform, got {other:?}"),
+        }
+        caps.transforms.push(wgt::SurfaceTransform::Rotate90);
+        validate_surface_configuration(&mut config, &caps, 4096).unwrap();
     }
 
     /// `Auto` never resolves to the encoded extended-range sRGB color space,

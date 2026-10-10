@@ -828,6 +828,8 @@ impl Surface {
             present_modes: hal_caps.present_modes,
             alpha_modes: hal_caps.composite_alpha_modes,
             usages,
+            transforms: hal_caps.transforms,
+            current_transform: hal_caps.current_transform,
         })
     }
 
@@ -1003,6 +1005,7 @@ impl Surface {
                     | wgt::TextureFormatFeatureFlags::STORAGE_READ_WRITE,
             ),
             view_formats: hal_view_formats,
+            pre_transform: config.pre_transform,
         };
 
         crate::device::surface_config::validate_surface_configuration(
