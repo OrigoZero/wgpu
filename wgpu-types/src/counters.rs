@@ -117,6 +117,11 @@ pub struct HalCounters {
     pub pipeline_layouts: InternalCounter,
     pub samplers: InternalCounter,
     pub command_encoders: InternalCounter,
+    /// Number of command buffers the command encoders hold, in use or free
+    /// for reuse. Counted by the Vulkan backend, where each command encoder
+    /// is a command pool and the driver keeps host memory for every buffer
+    /// allocated from it.
+    pub command_buffers: InternalCounter,
     pub shader_modules: InternalCounter,
     pub query_sets: InternalCounter,
     pub fences: InternalCounter,

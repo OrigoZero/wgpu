@@ -1267,6 +1267,7 @@ impl crate::Device for super::Device {
             bind_point: vk::PipelineBindPoint::default(),
             temp: super::Temp::default(),
             free: Vec::new(),
+            allocated_buffers: 0,
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
             end_of_pass_timer_query: None,

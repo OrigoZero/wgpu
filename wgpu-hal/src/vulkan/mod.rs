@@ -973,6 +973,10 @@ pub struct CommandEncoder {
     /// These are all in the Vulkan "initial" state.
     free: Vec<vk::CommandBuffer>,
 
+    /// How many command buffers this encoder has allocated from its pool and
+    /// not freed, wherever they are now.
+    allocated_buffers: usize,
+
     /// A pool of discarded command buffers.
     ///
     /// These could be in any Vulkan state except "pending".
@@ -1022,6 +1026,9 @@ impl Drop for CommandEncoder {
         }
 
         self.counters.command_encoders.sub(1);
+        self.counters
+            .command_buffers
+            .sub(self.allocated_buffers as isize);
     }
 }
 

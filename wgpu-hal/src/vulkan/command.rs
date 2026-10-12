@@ -131,6 +131,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     .map_err(super::map_host_device_oom_err)?
             };
             self.free.extend(cmd_buf_vec);
+            self.allocated_buffers += ALLOCATION_GRANULARITY as usize;
+            self.counters
+                .command_buffers
+                .add(ALLOCATION_GRANULARITY as isize);
         }
         let raw = self.free.pop().unwrap();
 
