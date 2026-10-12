@@ -1268,6 +1268,8 @@ impl crate::Device for super::Device {
             temp: super::Temp::default(),
             free: Vec::new(),
             allocated_buffers: 0,
+            free_low_water: 0,
+            resets_in_window: 0,
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
             end_of_pass_timer_query: None,

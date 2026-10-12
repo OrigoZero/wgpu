@@ -5,6 +5,17 @@ use core::{mem, ops::Range};
 use hashbrown::hash_map::Entry;
 
 const ALLOCATION_GRANULARITY: u32 = 16;
+
+/// How many recordings (`reset_all` calls) make one trimming window of a
+/// [`super::CommandEncoder`]'s free command buffers.
+///
+/// A recording that needs many command buffers (one per render and compute
+/// pass, plus the barriers between them) grows the encoder's pool to that
+/// many, and the driver keeps host memory for each of them. At the end of
+/// each window the encoder frees the buffers that no recording in the window
+/// took, so the pool holds what its recent recordings needed rather than the
+/// most any recording ever needed.
+pub(super) const COMMAND_BUFFER_TRIM_WINDOW: u32 = 64;
 const DST_IMAGE_LAYOUT: vk::ImageLayout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
 
 impl super::Texture {
@@ -121,6 +132,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
         if self.free.is_empty() {
+            // The window's low-water mark is already zero; the buffers this
+            // allocates on top have yet to sit out a window.
+            self.free_low_water = 0;
             let vk_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.raw)
                 .command_buffer_count(ALLOCATION_GRANULARITY);
@@ -137,6 +151,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .add(ALLOCATION_GRANULARITY as isize);
         }
         let raw = self.free.pop().unwrap();
+        self.free_low_water = self.free_low_water.min(self.free.len());
 
         // Set the name unconditionally, since there might be a
         // previous name assigned to this.
@@ -193,6 +208,26 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .raw
                 .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
         };
+
+        self.resets_in_window += 1;
+        if self.resets_in_window >= COMMAND_BUFFER_TRIM_WINDOW {
+            let idle = self.free_low_water.min(self.free.len());
+            if idle > 0 {
+                // Every buffer in `free` is in the initial state after the
+                // pool reset above, and none is pending: `reset_all` is only
+                // called once the encoder's submissions are done.
+                unsafe {
+                    self.device
+                        .raw
+                        .free_command_buffers(self.raw, &self.free[..idle])
+                };
+                self.free.drain(..idle);
+                self.allocated_buffers -= idle;
+                self.counters.command_buffers.sub(idle as isize);
+            }
+            self.resets_in_window = 0;
+            self.free_low_water = self.free.len();
+        }
     }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)

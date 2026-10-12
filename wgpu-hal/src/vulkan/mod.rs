@@ -971,11 +971,22 @@ pub struct CommandEncoder {
     /// A pool of available command buffers.
     ///
     /// These are all in the Vulkan "initial" state.
+    ///
+    /// `begin_encoding` takes from and `reset_all` returns to its end, so the
+    /// buffers at its start are the ones no recording has needed for longest.
     free: Vec<vk::CommandBuffer>,
 
     /// How many command buffers this encoder has allocated from its pool and
     /// not freed, wherever they are now.
     allocated_buffers: usize,
+
+    /// The fewest buffers `free` held at any moment since the current trimming
+    /// window began: how many buffers at its start no recording in the window
+    /// took. See [`command::COMMAND_BUFFER_TRIM_WINDOW`].
+    free_low_water: usize,
+
+    /// How many `reset_all` calls the current trimming window has seen.
+    resets_in_window: u32,
 
     /// A pool of discarded command buffers.
     ///
