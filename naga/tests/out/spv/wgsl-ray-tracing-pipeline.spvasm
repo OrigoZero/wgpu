@@ -11,14 +11,6 @@ OpEntryPoint RayGenerationKHR %23 "ray_gen_main" %18 %21
 OpEntryPoint MissKHR %138 "miss" %130 %133 %135
 OpEntryPoint AnyHitKHR %150 "any_hit_main" %141 %144 %146 %148
 OpEntryPoint ClosestHitKHR %168 "closest_hit_main" %159 %161 %163 %166
-OpMemberDecorate %4 0 Offset 0
-OpMemberDecorate %4 1 Offset 4
-OpMemberDecorate %9 0 Offset 0
-OpMemberDecorate %9 1 Offset 4
-OpMemberDecorate %9 2 Offset 8
-OpMemberDecorate %9 3 Offset 12
-OpMemberDecorate %9 4 Offset 16
-OpMemberDecorate %9 5 Offset 32
 OpDecorate %13 DescriptorSet 0
 OpDecorate %13 Binding 0
 OpDecorate %18 BuiltIn LaunchIdKHR

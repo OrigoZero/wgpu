@@ -11,17 +11,22 @@ SPIR-V version, and in `Function` and `Private` storage from SPIR-V 1.5 on
 So the writer decorates exactly the types reachable from a global in a storage
 class that takes explicit layout ([`Writer::collect_explicit_layout_types`]),
 and declares every other type without layout. A type that is both, such as a
-struct a storage buffer holds and a function keeps in a local variable, has
-two declarations:
+struct a storage buffer holds and a workgroup variable holds too, has two
+declarations:
 
 - The explicitly laid out declaration, which is the type of every SPIR-V value
-  of that Naga type and of every variable in a storage class that takes
-  explicit layout.
+  of that Naga type and of every variable in a storage class that accepts
+  explicit layout at the module's SPIR-V version.
 
 - Its *implicit-layout variant* ([`Writer::implicit_layout_type_id`]): the same
   members or elements, declared without decorations, holding implicit-layout
   variants of its own members. A variable in a storage class that refuses
-  explicit layout ([`refuses_explicit_layout`]) holds this variant.
+  explicit layout at the module's SPIR-V version ([`refuses_explicit_layout`])
+  holds this variant.
+
+Before SPIR-V 1.5 a `Function` or `Private` variable holds the type of its
+values, laid out or not, which those versions accept, so it is loaded and stored
+with no conversion.
 
 A load from such a variable reads the variant and converts the value to the
 explicitly laid out type; a store converts the other way
@@ -36,14 +41,14 @@ use spirv::Word;
 
 use super::{Instruction, Writer};
 
-/// Whether a variable in `class` must hold a type without explicit layout.
-pub(super) const fn refuses_explicit_layout(class: spirv::StorageClass) -> bool {
-    matches!(
-        class,
-        spirv::StorageClass::Function
-            | spirv::StorageClass::Private
-            | spirv::StorageClass::Workgroup
-    )
+/// Whether a variable in `class` must hold a type without explicit layout in a
+/// module of SPIR-V `version` (the version word of the module's header).
+pub(super) const fn refuses_explicit_layout(class: spirv::StorageClass, version: Word) -> bool {
+    match class {
+        spirv::StorageClass::Workgroup => true,
+        spirv::StorageClass::Function | spirv::StorageClass::Private => version >= 0x10500,
+        _ => false,
+    }
 }
 
 /// The members of a declared struct or the element of a declared fixed-size
@@ -121,7 +126,7 @@ impl Writer {
 
     /// The type a variable in `class` holds for values of `type_id`.
     pub(super) fn variable_type_id(&mut self, type_id: Word, class: spirv::StorageClass) -> Word {
-        if refuses_explicit_layout(class) {
+        if refuses_explicit_layout(class, self.physical_layout.version) {
             self.implicit_layout_type_id(type_id)
         } else {
             type_id
