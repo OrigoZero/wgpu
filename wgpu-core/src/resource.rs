@@ -678,8 +678,11 @@ impl Buffer {
             };
         }
 
-        // TODO: we are ignoring the transition here, I think we need to add a barrier
-        // at the end of the submission
+        // The transition this answers needs no barrier of its own. Every
+        // submission that writes a buffer the host maps for reading ends with
+        // that buffer's transition to the host's read (`Queue::submit`), and
+        // a map for writing waits on the fence of the last submission that
+        // used the buffer, which orders the host's writes after that use.
         device
             .trackers
             .lock()

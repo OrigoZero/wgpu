@@ -386,11 +386,35 @@ impl PendingWrites {
         command_allocator: &CommandAllocator,
         device: &Arc<Device>,
         queue: &Queue,
+        snatch_guard: &SnatchGuard,
     ) -> Result<Option<EncoderInFlight>, DeviceError> {
         if self.is_recording {
             let pending_buffers = mem::take(&mut self.dst_buffers);
             let pending_textures = mem::take(&mut self.dst_textures);
             let pending_blas_s = mem::take(&mut self.copied_blas_s);
+
+            // Make what these writes copied into a buffer the host maps for
+            // reading visible to the host, as `Queue::submit` does for the
+            // command buffers it submits. A write copies into its buffer
+            // (`COPY_DST`); a command buffer of the same submission that uses
+            // the buffer after it transitions from that use itself.
+            {
+                let host_read_barriers = pending_buffers
+                    .values()
+                    .filter(|buffer| buffer.usage.contains(wgt::BufferUsages::MAP_READ))
+                    .filter_map(|buffer| buffer.raw(snatch_guard))
+                    .map(|buffer| hal::BufferBarrier {
+                        buffer,
+                        usage: hal::StateTransition {
+                            from: wgt::BufferUses::COPY_DST,
+                            to: wgt::BufferUses::MAP_READ,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                if !host_read_barriers.is_empty() {
+                    unsafe { self.command_encoder.transition_buffers(&host_read_barriers) };
+                }
+            }
 
             let cmd_buf = unsafe { self.command_encoder.end_encoding() }
                 .map_err(|e| device.handle_hal_error(e))?;
@@ -1353,6 +1377,45 @@ impl Queue {
                             used_surface_textures = track::TextureUsageScope::default();
                         }
 
+                        // Make what this command buffer wrote to a buffer the host maps for
+                        // reading visible to the host. The fence the host waits on before
+                        // mapping makes the device's writes available, and visible to the
+                        // device alone; the host reads them through a dependency whose
+                        // destination is the host's read, which this transition records.
+                        // The device tracker takes the buffer's `MAP_READ` state from it,
+                        // so the next use transitions from the host's read.
+                        let host_readable = baked
+                            .trackers
+                            .buffers
+                            .used_resources()
+                            .filter(|buffer| buffer.usage.contains(wgt::BufferUsages::MAP_READ))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let host_read_barriers = host_readable
+                            .iter()
+                            .filter_map(|buffer| {
+                                trackers
+                                    .buffers
+                                    .set_single(buffer, wgt::BufferUses::MAP_READ)
+                                    .map(|pending| pending.into_hal(buffer, &snatch_guard))
+                            })
+                            .collect::<Vec<_>>();
+                        if !host_read_barriers.is_empty() {
+                            if let Err(e) = baked.encoder.open_pass(hal_label(
+                                Some("(wgpu internal) Host read"),
+                                self.device.instance_flags,
+                            )) {
+                                break 'error Err(e.into());
+                            }
+                            unsafe {
+                                baked.encoder.raw.transition_buffers(&host_read_barriers);
+                            };
+                            if let Err(e) = baked.encoder.close() {
+                                break 'error Err(e.into());
+                            }
+                        }
+                        drop(host_read_barriers);
+
                         // done
                         active_executions.push(EncoderInFlight {
                             inner: baked.encoder,
@@ -1416,7 +1479,12 @@ impl Queue {
                 }
             }
 
-            match pending_writes.pre_submit(&self.device.command_allocator, &self.device, self) {
+            match pending_writes.pre_submit(
+                &self.device.command_allocator,
+                &self.device,
+                self,
+                &snatch_guard,
+            ) {
                 Ok(Some(pending_execution)) => {
                     active_executions.insert(0, pending_execution);
                 }
