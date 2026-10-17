@@ -163,7 +163,9 @@ impl Writer {
         let label_id = self.id_gen.next();
         let mut block = Block::new(label_id);
 
-        let blank_intersection = self.get_constant_null(intersection_type_id);
+        let held_intersection_type_id =
+            self.variable_type_id(intersection_type_id, spirv::StorageClass::Function);
+        let blank_intersection = self.get_constant_null(held_intersection_type_id);
         let blank_intersection_id = self.id_gen.next();
         // This must be before everything else in the function.
         block.body.push(Instruction::variable(
@@ -571,13 +573,12 @@ impl Writer {
         function.consume(merge_block, Instruction::branch(outer_merge_label_id));
         function.consume(outer_merge_block, Instruction::branch(final_label_id));
 
-        let loaded_blank_intersection_id = self.id_gen.next();
-        final_block.body.push(Instruction::load(
+        let loaded_blank_intersection_id = self.write_value_load(
+            &mut final_block.body,
             intersection_type_id,
-            loaded_blank_intersection_id,
             blank_intersection_id,
-            None,
-        ));
+            spirv::StorageClass::Function,
+        );
         function.consume(
             final_block,
             Instruction::return_value(loaded_blank_intersection_id),
@@ -1650,7 +1651,11 @@ impl Writer {
             ptr_return_ty,
             return_id,
             spirv::StorageClass::Function,
-            Some(self.get_constant_null(rq_get_vertex_positions_ty_id)),
+            Some({
+                let held_type_id = self
+                    .variable_type_id(rq_get_vertex_positions_ty_id, spirv::StorageClass::Function);
+                self.get_constant_null(held_type_id)
+            }),
         ));
 
         let valid_id = self.id_gen.next();
@@ -1752,20 +1757,23 @@ impl Writer {
                 query_id,
                 intersection_id,
             ));
-        vertex_return_block
-            .body
-            .push(Instruction::store(return_id, vertices_id, None));
+        self.write_value_store(
+            &mut vertex_return_block.body,
+            rq_get_vertex_positions_ty_id,
+            vertices_id,
+            return_id,
+            spirv::StorageClass::Function,
+        );
 
         function.consume(vertex_return_block, Instruction::branch(merge_label_id));
         function.consume(merge_block, Instruction::branch(final_label_id));
 
-        let loaded_pos_id = self.id_gen.next();
-        final_block.body.push(Instruction::load(
+        let loaded_pos_id = self.write_value_load(
+            &mut final_block.body,
             rq_get_vertex_positions_ty_id,
-            loaded_pos_id,
             return_id,
-            None,
-        ));
+            spirv::StorageClass::Function,
+        );
 
         function.consume(final_block, Instruction::return_value(loaded_pos_id));
 

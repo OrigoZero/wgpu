@@ -2799,12 +2799,32 @@ impl BlockContext<'_> {
                 };
             };
 
+            // A pointer into a storage class that refuses explicit layout
+            // points to the implicit-layout variant of the value's type, so the
+            // load reads that variant and converts it.
+            let pointer_class = match access_type_adjustment {
+                AccessTypeAdjustment::IntroducePointer(class) => Some(class),
+                _ => match *self.fun_info[pointer].ty.inner_with(&self.ir_module.types) {
+                    crate::TypeInner::Pointer { space, .. }
+                    | crate::TypeInner::ValuePointer { space, .. } => {
+                        Some(map_storage_class(space))
+                    }
+                    _ => None,
+                },
+            };
+
             let (load_type_id, access_type_adjustment) = match wrapped_load {
                 Some(ref wrapped_load) => (
                     self.writer.std140_compat_uniform_types[&wrapped_load.r#type].type_id,
                     wrapped_load.access_type_adjustment,
                 ),
-                None => (result_type_id, access_type_adjustment),
+                None => (
+                    match pointer_class {
+                        Some(class) => self.writer.variable_type_id(result_type_id, class),
+                        None => result_type_id,
+                    },
+                    access_type_adjustment,
+                ),
             };
 
             let load_id = match self.write_access_chain(pointer, block, access_type_adjustment)? {
@@ -2877,7 +2897,12 @@ impl BlockContext<'_> {
                     ));
                     Ok(result_id)
                 }
-                None => Ok(load_id),
+                None => Ok(self.writer.write_layout_conversion(
+                    &mut block.body,
+                    load_id,
+                    load_type_id,
+                    result_type_id,
+                )),
             }
         }
     }
@@ -2934,9 +2959,14 @@ impl BlockContext<'_> {
         // that we store `a` into it, so that `a[z]` sees this iteration's value
         // of `a`.
         let base_id = self.cached[base];
-        block
-            .body
-            .push(Instruction::store(spill_variable_id, base_id, None));
+        let base_type_id = self.get_expression_type_id(&self.fun_info[base].ty);
+        self.writer.write_value_store(
+            &mut block.body,
+            base_type_id,
+            base_id,
+            spill_variable_id,
+            spirv::StorageClass::Function,
+        );
     }
 
     /// Generate an access to a spilled temporary, if necessary.
@@ -3770,7 +3800,24 @@ impl BlockContext<'_> {
                     self.writer.write_memory_barrier(flags, &mut block);
                 }
                 Statement::Store { pointer, value } => {
-                    let value_id = self.cached[value];
+                    // A pointer into a storage class that refuses explicit
+                    // layout points to the implicit-layout variant of the
+                    // value's type, so the value is converted to that variant.
+                    let value_type_id = self.get_expression_type_id(&self.fun_info[value].ty);
+                    let held_type_id =
+                        match *self.fun_info[pointer].ty.inner_with(&self.ir_module.types) {
+                            crate::TypeInner::Pointer { space, .. }
+                            | crate::TypeInner::ValuePointer { space, .. } => self
+                                .writer
+                                .variable_type_id(value_type_id, map_storage_class(space)),
+                            _ => value_type_id,
+                        };
+                    let value_id = self.writer.write_layout_conversion(
+                        &mut block.body,
+                        self.cached[value],
+                        value_type_id,
+                        held_type_id,
+                    );
                     match self.write_access_chain(
                         pointer,
                         &mut block,

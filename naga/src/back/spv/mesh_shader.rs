@@ -549,13 +549,12 @@ impl super::Writer {
                     self.get_constant_scalar(crate::Literal::U32(member_id as u32)),
                 ],
             ));
-            let val_to_copy = self.id_gen.next();
-            body.push(Instruction::load(
+            let val_to_copy = self.write_value_load(
+                &mut body,
                 member.ty_id,
-                val_to_copy,
                 val_to_copy_ptr,
-                None,
-            ));
+                spirv::StorageClass::Workgroup,
+            );
             let mut needs_y_flip = false;
             let ptr_to_copy_to = self.id_gen.next();
             // Get a pointer to the struct member to copy

@@ -896,6 +896,14 @@ impl super::Instruction {
         instruction
     }
 
+    pub(super) fn copy_logical(result_type_id: Word, id: Word, operand_id: Word) -> Self {
+        let mut instruction = Self::new(Op::CopyLogical);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction.add_operand(operand_id);
+        instruction
+    }
+
     pub(super) fn composite_extract(
         result_type_id: Word,
         id: Word,

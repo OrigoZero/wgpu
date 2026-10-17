@@ -6,6 +6,7 @@ use spirv::Word;
 
 use super::{
     block::DebugInfoInner,
+    explicit_layout::{CompositeShape, DeclaredComposite, DeclaredConstant},
     helpers::{contains_builtin, global_needs_wrapper, map_storage_class},
     Block, BlockContext, CachedConstant, CachedExpressions, CooperativeType, DebugInfo,
     EntryPointContext, Error, Function, FunctionArgument, GlobalVariable, IdGenerator, Instruction,
@@ -105,6 +106,11 @@ impl Writer {
             cached_constants: crate::FastHashMap::default(),
             global_variables: HandleVec::new(),
             std140_compat_uniform_types: crate::FastHashMap::default(),
+            explicit_layout_types: crate::FastHashSet::default(),
+            declared_composites: crate::FastHashMap::default(),
+            implicit_layout_variants: crate::FastHashMap::default(),
+            declared_constants: crate::FastHashMap::default(),
+            implicit_layout_constants: crate::FastHashMap::default(),
             fake_missing_bindings: options.fake_missing_bindings,
             binding_map: options.binding_map.clone(),
             saved_cached: CachedExpressions::default(),
@@ -200,6 +206,11 @@ impl Writer {
             cached_constants: take(&mut self.cached_constants).reclaim(),
             global_variables: take(&mut self.global_variables).reclaim(),
             std140_compat_uniform_types: take(&mut self.std140_compat_uniform_types).reclaim(),
+            explicit_layout_types: take(&mut self.explicit_layout_types).reclaim(),
+            declared_composites: take(&mut self.declared_composites).reclaim(),
+            implicit_layout_variants: take(&mut self.implicit_layout_variants).reclaim(),
+            declared_constants: take(&mut self.declared_constants).reclaim(),
+            implicit_layout_constants: take(&mut self.implicit_layout_constants).reclaim(),
             saved_cached: take(&mut self.saved_cached).reclaim(),
             temp_list: take(&mut self.temp_list).reclaim(),
             ray_query_functions: take(&mut self.ray_query_functions).reclaim(),
@@ -339,7 +350,12 @@ impl Writer {
         self.get_type_id(LookupType::Local(local))
     }
 
+    /// The type of a pointer in `class` to values of `base`.
+    ///
+    /// A pointer in a storage class that refuses explicit layout points to the
+    /// implicit-layout variant of `base`. See [`super::explicit_layout`].
     pub(super) fn get_pointer_type_id(&mut self, base: Word, class: spirv::StorageClass) -> Word {
+        let base = self.variable_type_id(base, class);
         self.get_type_id(LookupType::Local(LocalType::Pointer { base, class }))
     }
 
@@ -477,10 +493,11 @@ impl Writer {
                 LocalType::Cooperative(CooperativeType::from_inner(inner).unwrap())
             }
             crate::TypeInner::Pointer { base, space } => {
+                let class = map_storage_class(space);
                 let base_type_id = self.get_handle_type_id(base);
                 LocalType::Pointer {
-                    base: base_type_id,
-                    class: map_storage_class(space),
+                    base: self.variable_type_id(base_type_id, class),
+                    class,
                 }
             }
             crate::TypeInner::ValuePointer {
@@ -1551,7 +1568,25 @@ impl Writer {
                 }
             }
 
-            let init_word = variable.init.map(|constant| context.cached[constant]);
+            let value_type_id = context.get_handle_type_id(variable.ty);
+            let held_type_id = context
+                .writer
+                .variable_type_id(value_type_id, spirv::StorageClass::Function);
+            let mut init_word = variable.init.map(|constant| context.cached[constant]);
+            if let Some(value_id) = init_word.filter(|_| held_type_id != value_type_id) {
+                // The variable holds the implicit-layout variant of its type,
+                // so its initializer is the same value in that variant.
+                init_word = context.writer.implicit_layout_constant(value_id);
+                if init_word.is_none() {
+                    context.writer.write_value_store(
+                        &mut prelude.body,
+                        value_type_id,
+                        value_id,
+                        id,
+                        spirv::StorageClass::Function,
+                    );
+                }
+            }
             let pointer_type_id = context
                 .writer
                 .get_handle_pointer_type_id(variable.ty, spirv::StorageClass::Function);
@@ -1561,10 +1596,7 @@ impl Writer {
                 spirv::StorageClass::Function,
                 init_word.or_else(|| match ir_module.types[variable.ty].inner {
                     crate::TypeInner::RayQuery { .. } => None,
-                    _ => {
-                        let type_id = context.get_handle_type_id(variable.ty);
-                        Some(context.writer.write_constant_null(type_id))
-                    }
+                    _ => Some(context.writer.write_constant_null(held_type_id)),
                 }),
             );
 
@@ -2103,14 +2135,28 @@ impl Writer {
             use spirv::Decoration;
 
             let id = self.id_gen.next();
+            let explicit_layout = self.explicit_layout_types.contains(&handle);
             let instruction = match ty.inner {
                 crate::TypeInner::Array { base, size, stride } => {
-                    self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    if explicit_layout {
+                        self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    }
 
                     let type_id = self.get_handle_type_id(base);
                     match size.resolve(module.to_ctx())? {
                         crate::proc::IndexableLength::Known(length) => {
                             let length_id = self.get_index_constant(length);
+                            self.declared_composites.insert(
+                                id,
+                                DeclaredComposite {
+                                    shape: CompositeShape::Array {
+                                        element: type_id,
+                                        length_id,
+                                        length,
+                                    },
+                                    explicit_layout,
+                                },
+                            );
                             Instruction::type_array(id, type_id, length_id)
                         }
                         crate::proc::IndexableLength::Dynamic => {
@@ -2148,13 +2194,33 @@ impl Writer {
                             }
                             _ => (),
                         }
-                        self.decorate_struct_member(id, index, member, &module.types)?;
+                        self.decorate_struct_member(
+                            id,
+                            index,
+                            member,
+                            &module.types,
+                            explicit_layout,
+                        )?;
                         let member_id = self.get_handle_type_id(member.ty);
                         member_ids.push(member_id);
                     }
                     if has_runtime_array {
                         self.decorate(id, Decoration::Block, &[]);
                     }
+                    self.declared_composites.insert(
+                        id,
+                        DeclaredComposite {
+                            shape: CompositeShape::Struct {
+                                members: member_ids.clone(),
+                                member_names: members
+                                    .iter()
+                                    .map(|member| member.name.clone())
+                                    .collect(),
+                                name: ty.name.clone(),
+                            },
+                            explicit_layout,
+                        },
+                    );
                     Instruction::type_struct(id, member_ids.as_slice())
                 }
 
@@ -2394,6 +2460,7 @@ impl Writer {
                                                 next_index as usize,
                                                 member,
                                                 &module.types,
+                                                true,
                                             )?;
                                             self.get_handle_type_id(member.ty)
                                         }
@@ -2589,6 +2656,13 @@ impl Writer {
         let type_id = self.get_type_id(ty);
         Instruction::constant_composite(type_id, id, constituent_ids)
             .to_words(&mut self.logical_layout.declarations);
+        self.declared_constants.insert(
+            id,
+            DeclaredConstant::Composite {
+                type_id,
+                constituents: constituent_ids.to_vec(),
+            },
+        );
     }
 
     pub(super) fn get_constant_null(&mut self, type_id: Word) -> Word {
@@ -2605,6 +2679,8 @@ impl Writer {
         let null_id = self.id_gen.next();
         Instruction::constant_null(type_id, null_id)
             .to_words(&mut self.logical_layout.declarations);
+        self.declared_constants
+            .insert(null_id, DeclaredConstant::Null { type_id });
         null_id
     }
 
@@ -2750,7 +2826,9 @@ impl Writer {
                 // variables in the `Uniform` and `StorageBuffer` address spaces
                 // get wrapped, and we're initializing `WorkGroup` variables.
                 let var_id = self.global_variables[handle].var_id;
-                let var_type_id = self.get_handle_type_id(var.ty);
+                let value_type_id = self.get_handle_type_id(var.ty);
+                let var_type_id =
+                    self.variable_type_id(value_type_id, map_storage_class(var.space));
                 let init_word = self.get_constant_null(var_type_id);
                 Instruction::store(var_id, init_word, None)
             })
@@ -3352,12 +3430,23 @@ impl Writer {
             }
         };
 
-        let init_word = global_variable
-            .init
-            .map(|constant| self.constant_ids[constant]);
         let inner_type_id = self.get_type_id(
             substitute_inner_type_lookup.unwrap_or(LookupType::Handle(global_variable.ty)),
         );
+        // A variable in a storage class that refuses explicit layout holds the
+        // implicit-layout variant of its type, and is initialized with its
+        // initializer's value in that variant.
+        let held_type_id = self.variable_type_id(inner_type_id, class);
+        let init_word = match global_variable.init {
+            Some(constant) if held_type_id != inner_type_id => Some(
+                self.implicit_layout_constant(self.constant_ids[constant])
+                    .ok_or(Error::Validation(
+                        "global variable initializer is not a composite constant",
+                    ))?,
+            ),
+            Some(constant) => Some(self.constant_ids[constant]),
+            None => None,
+        };
 
         // generate the wrapping structure if needed
         let pointer_type_id = if global_needs_wrapper(ir_module, global_variable) {
@@ -3383,7 +3472,13 @@ impl Writer {
                         binding: None,
                         offset: 0,
                     };
-                    self.decorate_struct_member(wrapper_type_id, 0, &member, &ir_module.types)?;
+                    self.decorate_struct_member(
+                        wrapper_type_id,
+                        0,
+                        &member,
+                        &ir_module.types,
+                        true,
+                    )?;
 
                     Instruction::type_struct(wrapper_type_id, &[inner_type_id])
                         .to_words(&mut self.logical_layout.declarations);
@@ -3439,7 +3534,7 @@ impl Writer {
         let init_word = match (global_variable.space, self.zero_initialize_workgroup_memory) {
             (crate::AddressSpace::Private, _)
             | (crate::AddressSpace::WorkGroup, super::ZeroInitializeWorkgroupMemoryMode::Native) => {
-                init_word.or_else(|| Some(self.get_constant_null(inner_type_id)))
+                init_word.or_else(|| Some(self.get_constant_null(held_type_id)))
             }
             _ => init_word,
         };
@@ -3452,22 +3547,17 @@ impl Writer {
     /// Write the necessary decorations for a struct member.
     ///
     /// Emit decorations for the `index`'th member of the struct type
-    /// designated by `struct_id`, described by `member`.
+    /// designated by `struct_id`, described by `member`: its debug name, and
+    /// when `explicit_layout` is set, its layout decorations.
     fn decorate_struct_member(
         &mut self,
         struct_id: Word,
         index: usize,
         member: &crate::StructMember,
         arena: &UniqueArena<crate::Type>,
+        explicit_layout: bool,
     ) -> Result<(), Error> {
         use spirv::Decoration;
-
-        self.annotations.push(Instruction::member_decorate(
-            struct_id,
-            index as u32,
-            Decoration::Offset,
-            &[member.offset],
-        ));
 
         if self.flags.contains(WriterFlags::DEBUG) {
             if let Some(ref name) = member.name {
@@ -3475,6 +3565,17 @@ impl Writer {
                     .push(Instruction::member_name(struct_id, index as u32, name));
             }
         }
+
+        if !explicit_layout {
+            return Ok(());
+        }
+
+        self.annotations.push(Instruction::member_decorate(
+            struct_id,
+            index as u32,
+            Decoration::Offset,
+            &[member.offset],
+        ));
 
         // Matrices and (potentially nested) arrays of matrices both require decorations,
         // so "see through" any arrays to determine if they're needed.
@@ -3625,7 +3726,9 @@ impl Writer {
             }
         }
 
-        // write all types
+        // write all types, with layout decorations on the ones host-shareable
+        // storage reaches
+        self.collect_explicit_layout_types(ir_module);
         for (handle, _) in ir_module.types.iter() {
             self.write_type_declaration_arena(ir_module, handle)?;
         }

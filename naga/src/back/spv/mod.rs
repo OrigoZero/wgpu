@@ -97,6 +97,7 @@ are read-only.
 */
 
 mod block;
+mod explicit_layout;
 mod f16_polyfill;
 mod helpers;
 mod image;
@@ -948,6 +949,19 @@ pub struct Writer {
     cached_constants: crate::FastHashMap<CachedConstant, Word>,
     global_variables: HandleVec<crate::GlobalVariable, GlobalVariable>,
     std140_compat_uniform_types: crate::FastHashMap<Handle<crate::Type>, Std140CompatTypeInfo>,
+    /// The types reachable from a global in a storage class that takes
+    /// explicit layout. Only these types carry layout decorations. See
+    /// [`explicit_layout`].
+    explicit_layout_types: crate::FastHashSet<Handle<crate::Type>>,
+    /// The shape of every struct and fixed-size array type declared, by id.
+    declared_composites: crate::FastHashMap<Word, explicit_layout::DeclaredComposite>,
+    /// The implicit-layout variant of each type that has been asked for one.
+    implicit_layout_variants: crate::FastHashMap<Word, Word>,
+    /// The parts of every composite and null constant declared, by id.
+    declared_constants: crate::FastHashMap<Word, explicit_layout::DeclaredConstant>,
+    /// The constant of the same value in the implicit-layout variant of each
+    /// constant's type that has been asked for one.
+    implicit_layout_constants: crate::FastHashMap<Word, Word>,
     fake_missing_bindings: bool,
     binding_map: BindingMap,
 
