@@ -5,11 +5,13 @@ of variables in storage classes that take them.
 Vulkan refuses `Offset`, `ArrayStride`, `MatrixStride`, `ColMajor` and
 `RowMajor` on the type of a variable in `Workgroup` storage, and in `Function`
 and `Private` storage from SPIR-V 1.5 on (`VUID-StandaloneSpirv-None-10684`).
+Before SPIR-V 1.5 a `Function` or `Private` variable of a type host-shareable
+storage holds keeps that type's layout, and is loaded and stored as it is.
 */
 
 #![cfg(all(feature = "wgsl-in", spv_out))]
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 use rspirv::dr::{Instruction, Module, Operand};
 use spirv::{Decoration, Op, StorageClass, Word};
@@ -173,24 +175,45 @@ fn types_held_in(module: &Module, classes: &[StorageClass]) -> HashSet<Word> {
     held
 }
 
-const REFUSING: [StorageClass; 3] = [
-    StorageClass::Function,
-    StorageClass::Private,
-    StorageClass::Workgroup,
-];
+/// The storage classes whose variables refuse explicit layout at SPIR-V
+/// `lang_version`.
+fn refusing_classes(lang_version: (u8, u8)) -> &'static [StorageClass] {
+    if lang_version >= (1, 5) {
+        &[
+            StorageClass::Function,
+            StorageClass::Private,
+            StorageClass::Workgroup,
+        ]
+    } else {
+        &[StorageClass::Workgroup]
+    }
+}
+
+const LANG_VERSIONS: [(u8, u8); 5] = [(1, 0), (1, 3), (1, 4), (1, 5), (1, 6)];
 
 fn assert_no_layout_in_refusing_classes(source: &str) {
-    for lang_version in [(1, 0), (1, 3), (1, 4), (1, 5), (1, 6)] {
+    for lang_version in LANG_VERSIONS {
         let module = write_spirv(source, lang_version);
         let laid_out = laid_out_types(&module);
-        let held = types_held_in(&module, &REFUSING);
+        let held = types_held_in(&module, refusing_classes(lang_version));
         let offending: Vec<Word> = held.intersection(&laid_out).copied().collect();
         assert!(
             offending.is_empty(),
             "SPIR-V {lang_version:?}: types {offending:?} carry explicit layout and are held \
-             by Function, Private or Workgroup variables"
+             by variables of {:?}",
+            refusing_classes(lang_version)
         );
     }
+}
+
+/// Whether any function of `module` holds an instruction of `opcode`.
+fn uses(module: &Module, opcode: Op) -> bool {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| instruction.class.opcode == opcode)
 }
 
 #[test]
@@ -249,15 +272,43 @@ fn host_shareable_storage_keeps_its_layout() {
 fn a_value_moves_between_layouts_with_copy_logical_from_spirv_1_4() {
     for (lang_version, copies) in [((1, 3), false), ((1, 4), true), ((1, 6), true)] {
         let module = write_spirv(SHARED_TYPES, lang_version);
-        let copy_logical = module
-            .functions
-            .iter()
-            .flat_map(|function| &function.blocks)
-            .flat_map(|block| &block.instructions)
-            .any(|instruction| instruction.class.opcode == Op::CopyLogical);
+        let copy_logical = uses(&module, Op::CopyLogical);
         assert_eq!(
             copy_logical, copies,
             "SPIR-V {lang_version:?}: OpCopyLogical used: {copy_logical}"
+        );
+    }
+}
+
+/// A shader whose struct and array types a storage buffer holds and only
+/// `Function` and `Private` variables hold besides, copied between them whole.
+const FUNCTION_AND_PRIVATE_SHARED_TYPES: &str = r#"
+struct S { a: vec4<f32>, m: mat2x3<f32>, v: array<vec4<i32>, 4> }
+@group(0) @binding(0) var<storage, read_write> buf: array<S, 2>;
+var<private> p: S;
+
+@compute @workgroup_size(1)
+fn main(@builtin(local_invocation_index) li: u32) {
+    var local = buf[0];
+    p = buf[1];
+    buf[li % 2u] = local;
+    buf[0].v = p.v;
+}
+"#;
+
+#[test]
+fn function_and_private_variables_hold_the_laid_out_type_before_spirv_1_5() {
+    for lang_version in LANG_VERSIONS {
+        let module = write_spirv(FUNCTION_AND_PRIVATE_SHARED_TYPES, lang_version);
+        let laid_out = laid_out_types(&module);
+        let held = types_held_in(&module, &[StorageClass::Function, StorageClass::Private]);
+        let holds_laid_out = !held.is_disjoint(&laid_out);
+        let converts = uses(&module, Op::CopyLogical) || uses(&module, Op::CompositeConstruct);
+        assert_eq!(
+            (holds_laid_out, converts),
+            (lang_version < (1, 5), lang_version >= (1, 5)),
+            "SPIR-V {lang_version:?}: Function or Private variables hold a laid out type: \
+             {holds_laid_out}, loads and stores convert between layouts: {converts}"
         );
     }
 }
