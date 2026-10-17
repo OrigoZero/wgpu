@@ -807,8 +807,11 @@ impl Buffer {
         // - `Some(0)`, if we have a queue and there is no submission to wait for.
         // - `None`, if we don't have a queue.
         //
-        // TODO(https://github.com/gfx-rs/wgpu/issues/9306): we are ignoring the transition
-        // here, I think we need to add a barrier at the end of the submission
+        // The transition this answers needs no barrier of its own. Every
+        // submission that writes a buffer the host maps for reading ends with
+        // that buffer's transition to the host's read (`Queue::submit`), and
+        // a map for writing waits on the fence of the last submission that
+        // used the buffer, which orders the host's writes after that use.
         device
             .trackers
             .lock()
