@@ -63,33 +63,6 @@ impl super::CommandEncoder {
         }
     }
 
-    fn make_framebuffer(
-        &mut self,
-        key: super::FramebufferKey,
-    ) -> Result<vk::Framebuffer, crate::DeviceError> {
-        Ok(match self.framebuffers.entry(key) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let super::FramebufferKey {
-                    raw_pass,
-                    ref attachment_views,
-                    attachment_identities: _,
-                    extent,
-                } = *e.key();
-
-                let vk_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(raw_pass)
-                    .width(extent.width)
-                    .height(extent.height)
-                    .layers(extent.depth_or_array_layers)
-                    .attachments(attachment_views);
-
-                let raw = unsafe { self.device.raw.create_framebuffer(&vk_info, None).unwrap() };
-                *e.insert(raw)
-            }
-        })
-    }
-
     fn make_temp_texture_view(
         &mut self,
         key: super::TempTextureViewKey,
@@ -235,10 +208,6 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.free
             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
         self.free.append(&mut self.discarded);
-        // Delete framebuffers from the framebuffer cache
-        for (_, framebuffer) in self.framebuffers.drain() {
-            unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
-        }
         let _ = unsafe {
             self.device
                 .raw
@@ -941,7 +910,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         let raw_pass = self.device.make_render_pass(rp_key).unwrap();
         fb_key.raw_pass = raw_pass;
-        let raw_framebuffer = self.make_framebuffer(fb_key).unwrap();
+        let raw_framebuffer = self.device.make_framebuffer(fb_key, &self.counters)?;
 
         let vk_info = vk::RenderPassBeginInfo::default()
             .render_pass(raw_pass)

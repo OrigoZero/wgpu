@@ -73,6 +73,55 @@ impl super::DeviceShared {
         };
     }
 
+    /// Destroy every cached framebuffer that has `view` among its
+    /// attachments. Called as the view is destroyed: by then no command
+    /// buffer that renders through it is still pending or being recorded.
+    pub(super) fn forget_framebuffers_of(
+        &self,
+        view: super::ResourceIdentity<vk::ImageView>,
+        counters: &wgt::HalCounters,
+    ) {
+        self.framebuffers.lock().retain(|key, framebuffer| {
+            let keep = !key.attachment_identities.contains(&view);
+            if !keep {
+                unsafe { self.raw.destroy_framebuffer(*framebuffer, None) };
+                counters.framebuffers.sub(1);
+            }
+            keep
+        });
+    }
+
+    /// The framebuffer of `key`, created on its first use.
+    pub(super) fn make_framebuffer(
+        &self,
+        key: super::FramebufferKey,
+        counters: &wgt::HalCounters,
+    ) -> Result<vk::Framebuffer, crate::DeviceError> {
+        Ok(match self.framebuffers.lock().entry(key) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let super::FramebufferKey {
+                    raw_pass,
+                    ref attachment_views,
+                    attachment_identities: _,
+                    extent,
+                } = *e.key();
+
+                let vk_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(raw_pass)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(extent.depth_or_array_layers)
+                    .attachments(attachment_views);
+
+                let raw = unsafe { self.raw.create_framebuffer(&vk_info, None) }
+                    .map_err(super::map_host_device_oom_err)?;
+                counters.framebuffers.add(1);
+                *e.insert(raw)
+            }
+        })
+    }
+
     pub fn make_render_pass(
         &self,
         key: super::RenderPassKey,
@@ -1176,6 +1225,8 @@ impl crate::Device for super::Device {
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
+        self.shared
+            .forget_framebuffers_of(view.view_identity, &self.counters);
         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
 
         self.counters.texture_views.sub(1);
@@ -1274,7 +1325,6 @@ impl crate::Device for super::Device {
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
             end_of_pass_timer_query: None,
-            framebuffers: Default::default(),
             temp_texture_views: Default::default(),
             counters: Arc::clone(&self.counters),
             current_pipeline_is_multiview: false,
