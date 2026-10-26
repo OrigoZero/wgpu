@@ -122,6 +122,10 @@ pub struct HalCounters {
     /// is a command pool and the driver keeps host memory for every buffer
     /// allocated from it.
     pub command_buffers: InternalCounter,
+    /// Number of framebuffers the device holds for the attachments render
+    /// passes began on. Counted by the Vulkan backend, which keeps each one
+    /// until one of its attachment views is destroyed.
+    pub framebuffers: InternalCounter,
     pub shader_modules: InternalCounter,
     pub query_sets: InternalCounter,
     pub fences: InternalCounter,

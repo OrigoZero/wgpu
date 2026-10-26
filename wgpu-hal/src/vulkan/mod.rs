@@ -484,6 +484,11 @@ struct DeviceShared {
     workarounds: Workarounds,
     features: wgt::Features,
     render_passes: Mutex<FastHashMap<RenderPassKey, vk::RenderPass>>,
+    /// Every framebuffer a render pass has begun on, by its render pass and
+    /// attachments. A framebuffer lives until one of its attachment views is
+    /// destroyed ([`DeviceShared::forget_framebuffers_of`]), so a frame that
+    /// renders to the same targets as the frame before creates none.
+    framebuffers: Mutex<FastHashMap<FramebufferKey, vk::Framebuffer>>,
     sampler_cache: Mutex<sampler::SamplerCache>,
     memory_allocations_counter: InternalCounter,
 
@@ -504,6 +509,9 @@ struct DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
+        for (_, framebuffer) in self.framebuffers.lock().drain() {
+            unsafe { self.raw.destroy_framebuffer(framebuffer, None) };
+        }
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
         }
@@ -1008,7 +1016,6 @@ pub struct CommandEncoder {
     /// the given pool & location.
     end_of_pass_timer_query: Option<(vk::QueryPool, u32)>,
 
-    framebuffers: FastHashMap<FramebufferKey, vk::Framebuffer>,
     temp_texture_views: FastHashMap<TempTextureViewKey, IdentifiedTextureView>,
 
     counters: Arc<wgt::HalCounters>,
@@ -1035,11 +1042,9 @@ impl Drop for CommandEncoder {
             self.device.raw.destroy_command_pool(self.raw, None);
         }
 
-        for (_, fb) in self.framebuffers.drain() {
-            unsafe { self.device.raw.destroy_framebuffer(fb, None) };
-        }
-
         for (_, view) in self.temp_texture_views.drain() {
+            self.device
+                .forget_framebuffers_of(view.identity, &self.counters);
             unsafe { self.device.raw.destroy_image_view(view.raw, None) };
         }
 
