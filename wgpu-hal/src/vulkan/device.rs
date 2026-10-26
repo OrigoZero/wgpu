@@ -1264,6 +1264,7 @@ impl crate::Device for super::Device {
             raw,
             device: Arc::clone(&self.shared),
             active: vk::CommandBuffer::null(),
+            set_aside: vk::CommandBuffer::null(),
             bind_point: vk::PipelineBindPoint::default(),
             temp: super::Temp::default(),
             free: Vec::new(),

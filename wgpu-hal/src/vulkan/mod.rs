@@ -962,6 +962,13 @@ pub struct CommandEncoder {
     /// If non-`null`, the buffer is in the Vulkan "recording" state.
     active: vk::CommandBuffer,
 
+    /// A command buffer still in the Vulkan "recording" state that
+    /// [`crate::CommandEncoder::set_aside_and_begin`] set aside, or `null`.
+    ///
+    /// It holds the commands recorded ahead of the pass `active` records, and
+    /// receives that pass's barriers once the pass is recorded.
+    set_aside: vk::CommandBuffer,
+
     /// What kind of pass we are currently within: compute or render.
     bind_point: vk::PipelineBindPoint,
 
