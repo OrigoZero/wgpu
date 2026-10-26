@@ -620,6 +620,11 @@ pub(crate) struct InnerCommandEncoder {
     /// [`wgpu_hal::CommandEncoder`]: hal::CommandEncoder
     pub(crate) is_open: bool,
 
+    /// True while the pass being recorded keeps the command buffer recorded
+    /// ahead of it set aside in `raw`, to receive the pass's prelude: see
+    /// [`InnerCommandEncoder::begin_pass`].
+    pub(crate) prelude_set_aside: bool,
+
     /// Tracks which API is being used to encode commands.
     ///
     /// Mixing the wgpu encoding API with access to the raw hal encoder via
@@ -781,6 +786,78 @@ impl InnerCommandEncoder {
 
         Ok(self.raw.as_mut())
     }
+
+    /// Begin recording a render or compute pass, with its own label.
+    ///
+    /// A pass's prelude (its barriers, the clears of discarded surfaces, query
+    /// resets and indirect validation) has to execute ahead of the pass and is
+    /// known only once the pass is recorded. Where the hal encoder can hold a
+    /// second command buffer in recording ([`hal::CommandEncoder::sets_aside`]),
+    /// the buffer recorded ahead of the pass is set aside, still recording,
+    /// and the prelude is appended to it afterwards: the pass's own buffer
+    /// then stays open for whatever is recorded after it, so a pass costs one
+    /// command buffer. Elsewhere the prelude gets a command buffer of its own,
+    /// put ahead of the pass's ([`Self::close_and_swap`]).
+    ///
+    /// After the pass, [`Self::end_pass`], [`Self::open_prelude`] and
+    /// [`Self::close_prelude`] are called in that order.
+    pub(crate) fn begin_pass(
+        &mut self,
+        label: Option<&str>,
+    ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+        debug_assert!(!self.prelude_set_aside);
+        if !self.raw.sets_aside() {
+            self.close_if_open()?;
+            return self.open_pass(label);
+        }
+        self.open()?;
+        let hal_label = hal_label(label, self.device.instance_flags);
+        unsafe { self.raw.set_aside_and_begin(hal_label) }
+            .map_err(|e| self.device.handle_hal_error(e))?;
+        self.prelude_set_aside = true;
+        Ok(self.raw.as_mut())
+    }
+
+    /// The pass begun by [`Self::begin_pass`] has been recorded.
+    pub(crate) fn end_pass(&mut self) -> Result<(), DeviceError> {
+        if self.prelude_set_aside {
+            // The buffer recorded ahead of the pass takes the prelude; the
+            // pass's buffer waits aside, still recording.
+            unsafe { self.raw.swap_set_aside() };
+            Ok(())
+        } else {
+            self.close()
+        }
+    }
+
+    /// The encoder to record the prelude of the pass just ended into.
+    pub(crate) fn open_prelude(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+        if self.prelude_set_aside {
+            Ok(self.raw.as_mut())
+        } else {
+            self.open_pass(Some("(wgpu internal) Pre Pass"))
+        }
+    }
+
+    /// Close the prelude, which then executes ahead of the pass.
+    ///
+    /// Where the prelude was appended to the buffer recorded ahead of the
+    /// pass, that buffer is finished and the pass's buffer is the one
+    /// recording again; otherwise the prelude's buffer is put ahead of the
+    /// pass's and the encoder is closed.
+    pub(crate) fn close_prelude(&mut self) -> Result<(), DeviceError> {
+        if !self.prelude_set_aside {
+            return self.close_and_swap();
+        }
+        self.prelude_set_aside = false;
+        let ahead = unsafe { self.raw.end_encoding() };
+        // Whatever the end answered, the pass's buffer is the one recording
+        // now, so a failure leaves the encoder in the state its drop expects.
+        unsafe { self.raw.resume_set_aside() };
+        let ahead = ahead.map_err(|e| self.device.handle_hal_error(e))?;
+        self.list.push(ahead);
+        Ok(())
+    }
 }
 
 impl Drop for InnerCommandEncoder {
@@ -891,6 +968,7 @@ impl CommandEncoder {
                         list: Vec::new(),
                         device: device.clone(),
                         is_open: false,
+                        prelude_set_aside: false,
                         api: EncodingApi::Undecided,
                         label: label.to_string(),
                     },

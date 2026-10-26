@@ -517,16 +517,11 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
+    // The pass's prelude is recorded after the pass and executes ahead of it:
+    // see `InnerCommandEncoder::begin_pass`.
     let raw_encoder = parent_state
         .raw_encoder
-        .open_pass(base.label.as_deref())
+        .begin_pass(base.label.as_deref())
         .map_pass_err(pass_scope)?;
 
     let mut debug_scope_depth = 0;
@@ -752,18 +747,12 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
-    // Stop the current command encoder.
-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
-
-    // Create a new command encoder, which we will insert _before_ the body of the compute pass.
-    //
-    // Use that buffer to insert barriers and clear discarded images.
+    // The pass is recorded; its prelude (barriers and the clears of discarded
+    // images) executes ahead of it.
+    parent_state.raw_encoder.end_pass().map_pass_err(pass_scope)?;
     let transit = parent_state
         .raw_encoder
-        .open_pass(hal_label(
-            Some("(wgpu internal) Pre Pass"),
-            device.instance_flags,
-        ))
+        .open_prelude()
         .map_pass_err(pass_scope)?;
     fixup_discarded_surfaces(
         pending_discard_init_fixups.into_iter(),
@@ -778,10 +767,9 @@ pub(super) fn encode_compute_pass(
         &intermediate_trackers,
         parent_state.snatch_guard,
     );
-    // Close the command encoder, and swap it with the previous.
     parent_state
         .raw_encoder
-        .close_and_swap()
+        .close_prelude()
         .map_pass_err(pass_scope)?;
 
     Ok(())

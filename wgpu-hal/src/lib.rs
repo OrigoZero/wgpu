@@ -1365,6 +1365,65 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
     where
         I: Iterator<Item = <Self::A as Api>::CommandBuffer>;
 
+    /// Whether this encoder can hold a second command buffer in the
+    /// recording state beside the current one: [`set_aside_and_begin`],
+    /// [`swap_set_aside`] and [`resume_set_aside`].
+    ///
+    /// With it, the commands a pass needs ahead of it (its barriers, which
+    /// are known only once the pass is recorded) are appended to the command
+    /// buffer recorded before the pass, rather than recorded into a command
+    /// buffer of their own and submitted ahead of the pass's. A frame of `n`
+    /// passes then submits about `n` command buffers rather than `2n`, and
+    /// every command buffer is a fixed cost to begin, submit and reset.
+    ///
+    /// [`set_aside_and_begin`]: CommandEncoder::set_aside_and_begin
+    /// [`swap_set_aside`]: CommandEncoder::swap_set_aside
+    /// [`resume_set_aside`]: CommandEncoder::resume_set_aside
+    fn sets_aside(&self) -> bool {
+        false
+    }
+
+    /// Set the command buffer under construction aside, still in the
+    /// recording state, and begin encoding a new one.
+    ///
+    /// The encoder stays in the "recording" state, recording the new buffer.
+    ///
+    /// # Safety
+    ///
+    /// [`sets_aside`] must answer true, this `CommandEncoder` must be in the
+    /// "recording" state, outside any pass, and no buffer may already be set
+    /// aside.
+    ///
+    /// [`sets_aside`]: CommandEncoder::sets_aside
+    unsafe fn set_aside_and_begin(&mut self, _label: Label) -> Result<(), DeviceError> {
+        unreachable!("set_aside_and_begin on an encoder whose sets_aside answers false")
+    }
+
+    /// Exchange the command buffer under construction with the one set
+    /// aside. Both stay in the recording state.
+    ///
+    /// # Safety
+    ///
+    /// A buffer must be set aside, and the encoder must be outside any pass.
+    unsafe fn swap_set_aside(&mut self) {
+        unreachable!("swap_set_aside on an encoder whose sets_aside answers false")
+    }
+
+    /// Make the buffer set aside the one under construction again, after
+    /// [`end_encoding`] closed the current one.
+    ///
+    /// This puts this `CommandEncoder` back in the "recording" state, with
+    /// nothing set aside.
+    ///
+    /// # Safety
+    ///
+    /// The encoder must be in the "closed" state with a buffer set aside.
+    ///
+    /// [`end_encoding`]: CommandEncoder::end_encoding
+    unsafe fn resume_set_aside(&mut self) {
+        unreachable!("resume_set_aside on an encoder whose sets_aside answers false")
+    }
+
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
     where
         T: Iterator<Item = BufferBarrier<'a, <Self::A as Api>::Buffer>>;

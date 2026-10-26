@@ -23,6 +23,11 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
 
     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>);
 
+    fn sets_aside(&self) -> bool;
+    unsafe fn set_aside_and_begin(&mut self, label: Label) -> Result<(), DeviceError>;
+    unsafe fn swap_set_aside(&mut self);
+    unsafe fn resume_set_aside(&mut self);
+
     unsafe fn transition_buffers(&mut self, barriers: &[BufferBarrier<'_, dyn DynBuffer>]);
     unsafe fn transition_textures(&mut self, barriers: &[TextureBarrier<'_, dyn DynTexture>]);
 
@@ -235,6 +240,22 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
 
     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>) {
         unsafe { C::reset_all(self, command_buffers.into_iter().map(|cb| cb.unbox())) }
+    }
+
+    fn sets_aside(&self) -> bool {
+        C::sets_aside(self)
+    }
+
+    unsafe fn set_aside_and_begin(&mut self, label: Label) -> Result<(), DeviceError> {
+        unsafe { C::set_aside_and_begin(self, label) }
+    }
+
+    unsafe fn swap_set_aside(&mut self) {
+        unsafe { C::swap_set_aside(self) }
+    }
+
+    unsafe fn resume_set_aside(&mut self) {
+        unsafe { C::resume_set_aside(self) }
     }
 
     unsafe fn transition_buffers(&mut self, barriers: &[BufferBarrier<'_, dyn DynBuffer>]) {

@@ -430,6 +430,7 @@ impl PendingWrites {
                     list: vec![cmd_buf],
                     device: device.clone(),
                     is_open: false,
+                    prelude_set_aside: false,
                     api: crate::command::EncodingApi::InternalUse,
                     label: "(wgpu internal) PendingWrites command encoder".into(),
                 },

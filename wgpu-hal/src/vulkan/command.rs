@@ -189,12 +189,48 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         self.discarded.push(self.active);
         self.active = vk::CommandBuffer::null();
+        // A buffer set aside is recording too, and nothing will end it now.
+        if self.set_aside != vk::CommandBuffer::null() {
+            self.discarded.push(self.set_aside);
+            self.set_aside = vk::CommandBuffer::null();
+        }
+    }
+
+    fn sets_aside(&self) -> bool {
+        true
+    }
+
+    unsafe fn set_aside_and_begin(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
+        assert_ne!(self.active, vk::CommandBuffer::null());
+        assert_eq!(self.set_aside, vk::CommandBuffer::null());
+        // Vulkan lets several command buffers of one pool record at once, as
+        // long as their recording is externally synchronized, which the
+        // `&mut self` of every recording call is.
+        self.set_aside = mem::replace(&mut self.active, vk::CommandBuffer::null());
+        if let Err(e) = unsafe { self.begin_encoding(label) } {
+            self.active = mem::replace(&mut self.set_aside, vk::CommandBuffer::null());
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    unsafe fn swap_set_aside(&mut self) {
+        assert_ne!(self.set_aside, vk::CommandBuffer::null());
+        assert_ne!(self.active, vk::CommandBuffer::null());
+        mem::swap(&mut self.active, &mut self.set_aside);
+    }
+
+    unsafe fn resume_set_aside(&mut self) {
+        assert_eq!(self.active, vk::CommandBuffer::null());
+        assert_ne!(self.set_aside, vk::CommandBuffer::null());
+        self.active = mem::replace(&mut self.set_aside, vk::CommandBuffer::null());
     }
 
     unsafe fn reset_all<I>(&mut self, cmd_bufs: I)
     where
         I: Iterator<Item = super::CommandBuffer>,
     {
+        debug_assert_eq!(self.set_aside, vk::CommandBuffer::null());
         self.temp.clear();
         self.free
             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
