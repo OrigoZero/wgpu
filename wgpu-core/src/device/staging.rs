@@ -18,9 +18,10 @@
 //! Every other staging buffer the device maps for one copy (the one
 //! `Queue::create_staging_buffer` hands out for `Queue::write_buffer_with`,
 //! the initial contents of a buffer mapped at creation, the metadata of an
-//! indirect-draw validation pass) is a whole chunk from the same pool when its
-//! bytes fit in one, back in the pool once the submission that copies out of
-//! it is done ([`StagingBuffer::new`]).
+//! indirect-draw validation pass) comes from the same pool when its bytes fit
+//! in a chunk: a buffer of the power of two its bytes round up to, back in the
+//! pool once the submission that copies out of it is done
+//! ([`StagingBuffer::new`]).
 //!
 //! [`StagingBuffer::new`]: crate::resource::StagingBuffer::new
 //!
@@ -40,23 +41,61 @@ use crate::{
 /// Size in bytes of each staging chunk, and the largest write a chunk holds.
 pub(crate) const STAGING_CHUNK_SIZE: u64 = 256 << 10;
 
-/// How many chunk acquisitions make one trimming window of a
+/// Size in bytes of the smallest pooled staging buffer.
+const SMALLEST_STAGING_CLASS_SIZE: u64 = 4 << 10;
+
+/// How many size classes a [`StagingPool`] keeps buffers in: one per power of
+/// two from [`SMALLEST_STAGING_CLASS_SIZE`] to [`STAGING_CHUNK_SIZE`].
+const STAGING_CLASS_COUNT: usize = (STAGING_CHUNK_SIZE.trailing_zeros()
+    - SMALLEST_STAGING_CLASS_SIZE.trailing_zeros()) as usize
+    + 1;
+
+/// How many acquisitions of one size class make one trimming window of a
 /// [`StagingPool`].
 ///
-/// At the end of each window the pool destroys the free chunks no acquisition
-/// in the window reached, so the pool settles at the most chunks the device
-/// had in flight at once during the window.
+/// At the end of each window the pool destroys the free buffers of the class
+/// no acquisition in the window reached, so the class settles at the most
+/// buffers the device had in flight at once during the window.
 pub(crate) const STAGING_POOL_TRIM_WINDOW: usize = 1024;
 
-/// The most free chunks a [`StagingPool`] keeps. A chunk released to a pool
-/// holding this many is destroyed, so a burst of uploads (a scene load) hands
-/// its staging memory back as its submissions retire.
-pub(crate) const STAGING_POOL_CAPACITY: usize = 16;
+/// The most free buffers a [`StagingPool`] keeps in one size class. A buffer
+/// released to a class holding this many is destroyed, so a burst of uploads
+/// (a scene load) hands its staging memory back as its submissions retire.
+pub(crate) const STAGING_POOL_CAPACITY: usize = 32;
 
-/// The free staging chunks of a device, each an unmapped buffer of
-/// [`STAGING_CHUNK_SIZE`] bytes that no submission still reads.
+/// The size class of a pooled staging buffer: the power of two its bytes
+/// round up to, from [`SMALLEST_STAGING_CLASS_SIZE`] to [`STAGING_CHUNK_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagingClass(u8);
+
+impl StagingClass {
+    /// The class of a whole staging chunk.
+    pub(crate) const CHUNK: Self = Self((STAGING_CLASS_COUNT - 1) as u8);
+
+    /// The class a staging buffer of `size` bytes is pooled in, or `None`
+    /// when `size` is larger than a chunk.
+    pub(crate) fn of(size: u64) -> Option<Self> {
+        if size > STAGING_CHUNK_SIZE {
+            return None;
+        }
+        let rounded = size.max(SMALLEST_STAGING_CLASS_SIZE).next_power_of_two();
+        Some(Self(
+            (rounded.trailing_zeros() - SMALLEST_STAGING_CLASS_SIZE.trailing_zeros()) as u8,
+        ))
+    }
+
+    /// Size in bytes of the buffers of this class.
+    pub(crate) fn size(self) -> u64 {
+        SMALLEST_STAGING_CLASS_SIZE << self.0
+    }
+}
+
+/// The free staging buffers of a device, each an unmapped buffer that no
+/// submission still reads, kept by [`StagingClass`]: the queue's staging
+/// chunks in the largest class, and the staging buffers mapped for one copy in
+/// the class their bytes round up to.
 pub(crate) struct StagingPool {
-    free: Mutex<TrimmedStack<Box<dyn hal::DynBuffer>>>,
+    free: Mutex<[TrimmedStack<Box<dyn hal::DynBuffer>>; STAGING_CLASS_COUNT]>,
 }
 
 impl StagingPool {
@@ -64,15 +103,19 @@ impl StagingPool {
         Self {
             free: Mutex::new(
                 rank::DEVICE_STAGING_POOL,
-                TrimmedStack::new(STAGING_POOL_TRIM_WINDOW),
+                core::array::from_fn(|_| TrimmedStack::new(STAGING_POOL_TRIM_WINDOW)),
             ),
         }
     }
 
-    /// A free chunk buffer, taken from the pool or, when the pool is empty,
-    /// created on `device`.
-    pub(crate) fn acquire(&self, device: &Device) -> Result<Box<dyn hal::DynBuffer>, DeviceError> {
-        let (raw, idle) = self.free.lock().pop();
+    /// A free buffer of `class`, taken from the pool or, when the pool holds
+    /// none, created on `device`.
+    pub(crate) fn acquire(
+        &self,
+        device: &Device,
+        class: StagingClass,
+    ) -> Result<Box<dyn hal::DynBuffer>, DeviceError> {
+        let (raw, idle) = self.free.lock()[class.0 as usize].pop();
         let destroyed = idle.len() as isize;
         for raw in idle {
             unsafe { device.raw().destroy_buffer(raw) };
@@ -83,8 +126,11 @@ impl StagingPool {
             return Ok(raw);
         }
         let desc = hal::BufferDescriptor {
-            label: hal_label(Some("(wgpu internal) Staging chunk"), device.instance_flags),
-            size: STAGING_CHUNK_SIZE,
+            label: hal_label(
+                Some("(wgpu internal) Pooled staging"),
+                device.instance_flags,
+            ),
+            size: class.size(),
             usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
             memory_flags: hal::MemoryFlags::TRANSIENT,
         };
@@ -94,12 +140,18 @@ impl StagingPool {
         Ok(raw)
     }
 
-    /// Put the chunk buffer `raw`, unmapped and read by no pending
-    /// submission, back in the pool, or destroy it when the pool is full.
-    pub(crate) fn release(&self, device: &Device, raw: Box<dyn hal::DynBuffer>) {
+    /// Put `raw`, a buffer of `class` unmapped and read by no pending
+    /// submission, back in the pool, or destroy it when its class is full.
+    pub(crate) fn release(
+        &self,
+        device: &Device,
+        raw: Box<dyn hal::DynBuffer>,
+        class: StagingClass,
+    ) {
         let mut free = self.free.lock();
-        if free.len() < STAGING_POOL_CAPACITY {
-            free.push(raw);
+        let stack = &mut free[class.0 as usize];
+        if stack.len() < STAGING_POOL_CAPACITY {
+            stack.push(raw);
             drop(free);
             device.counters.pooled_staging_buffers.add(1);
         } else {
@@ -108,10 +160,15 @@ impl StagingPool {
         }
     }
 
-    /// Destroy every chunk the pool holds. The device calls this as it is
-    /// dropped, when nothing else holds a chunk.
+    /// Destroy every buffer the pool holds. The device calls this as it is
+    /// dropped, when nothing else holds one.
     pub(crate) fn dispose(&self, device: &dyn hal::DynDevice) {
-        let held: Vec<_> = self.free.lock().drain();
+        let held: Vec<_> = self
+            .free
+            .lock()
+            .iter_mut()
+            .flat_map(|stack| stack.drain())
+            .collect();
         for raw in held {
             unsafe { device.destroy_buffer(raw) };
         }
@@ -138,12 +195,14 @@ unsafe impl Sync for StagingChunk {}
 impl StagingChunk {
     /// Take a chunk from `device`'s pool and map it.
     pub(crate) fn acquire(device: &Arc<Device>) -> Result<Self, DeviceError> {
-        let raw = device.staging_pool.acquire(device)?;
+        let raw = device.staging_pool.acquire(device, StagingClass::CHUNK)?;
         let mapping = match unsafe { device.raw().map_buffer(raw.as_ref(), 0..STAGING_CHUNK_SIZE) }
         {
             Ok(mapping) => mapping,
             Err(e) => {
-                device.staging_pool.release(device, raw);
+                device
+                    .staging_pool
+                    .release(device, raw, StagingClass::CHUNK);
                 return Err(device.handle_hal_error(e));
             }
         };
@@ -203,7 +262,12 @@ impl StagingChunk {
             };
         }
         unsafe { device.unmap_buffer(raw.as_ref()) };
-        FlushedStagingBuffer::pooled(raw, self.device.clone(), STAGING_CHUNK_SIZE)
+        FlushedStagingBuffer::pooled(
+            raw,
+            self.device.clone(),
+            STAGING_CHUNK_SIZE,
+            StagingClass::CHUNK,
+        )
     }
 }
 
@@ -214,7 +278,44 @@ impl Drop for StagingChunk {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
             unsafe { self.device.raw().unmap_buffer(raw.as_ref()) };
-            self.device.staging_pool.release(&self.device, raw);
+            self.device
+                .staging_pool
+                .release(&self.device, raw, StagingClass::CHUNK);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StagingClass, SMALLEST_STAGING_CLASS_SIZE, STAGING_CHUNK_SIZE};
+
+    #[test]
+    fn a_size_takes_the_smallest_class_that_holds_it() {
+        assert_eq!(
+            StagingClass::of(1).map(StagingClass::size),
+            Some(SMALLEST_STAGING_CLASS_SIZE)
+        );
+        assert_eq!(
+            StagingClass::of(4 << 10).map(StagingClass::size),
+            Some(4 << 10)
+        );
+        assert_eq!(
+            StagingClass::of((4 << 10) + 4).map(StagingClass::size),
+            Some(8 << 10)
+        );
+        assert_eq!(
+            StagingClass::of(100_000).map(StagingClass::size),
+            Some(128 << 10)
+        );
+        assert_eq!(
+            StagingClass::of(STAGING_CHUNK_SIZE),
+            Some(StagingClass::CHUNK)
+        );
+        assert_eq!(StagingClass::CHUNK.size(), STAGING_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn a_size_past_a_chunk_has_no_class() {
+        assert_eq!(StagingClass::of(STAGING_CHUNK_SIZE + 4), None);
     }
 }

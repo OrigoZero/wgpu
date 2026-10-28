@@ -19,8 +19,8 @@ use crate::device::trace;
 use crate::{
     binding_model::{BindGroup, BindingError},
     device::{
-        queue, resource::DeferredDestroy, BufferMapPendingClosure, Device, DeviceError,
-        DeviceMismatch, HostMap, MissingDownlevelFlags, MissingFeatures,
+        queue, resource::DeferredDestroy, staging::StagingClass, BufferMapPendingClosure, Device,
+        DeviceError, DeviceMismatch, HostMap, MissingDownlevelFlags, MissingFeatures,
     },
     hal_label,
     init_tracker::{BufferInitTracker, TextureInitTracker},
@@ -1094,9 +1094,10 @@ unsafe impl Sync for StagingBuffer {}
 /// A temporary buffer, consumed by the command that uses it.
 ///
 /// A [`StagingBuffer`] is designed for one-shot uploads of data to the GPU. It
-/// is always created mapped. One whose bytes fit in a staging chunk is a chunk
-/// of the device's staging pool, which it goes back to once the command that
-/// uses it is done; a larger one is created for its upload and destroyed then.
+/// is always created mapped. One whose bytes fit in a staging chunk is a
+/// buffer of the device's staging pool, of the power of two its bytes round up
+/// to, which it goes back to once the command that uses it is done; a larger
+/// one is created for its upload and destroyed then.
 ///
 /// [`StagingBuffer`]s can be created with [`queue_create_staging_buffer`] and
 /// used with [`queue_write_staging_buffer`]. They are also used internally by
@@ -1118,9 +1119,9 @@ pub struct StagingBuffer {
     pub(crate) size: wgt::BufferSize,
     is_coherent: bool,
     ptr: NonNull<u8>,
-    /// Whether the buffer is a chunk of the device's staging pool, which it
+    /// The class of the device's staging pool the buffer belongs to, which it
     /// goes back to once the submission that copies out of it is done.
-    pooled: bool,
+    pooled: Option<StagingClass>,
 }
 
 impl StagingBuffer {
@@ -1128,9 +1129,9 @@ impl StagingBuffer {
     /// staging pool when `size` fits in one, otherwise a buffer created for it.
     pub(crate) fn new(device: &Arc<Device>, size: wgt::BufferSize) -> Result<Self, DeviceError> {
         profiling::scope!("StagingBuffer::new");
-        let pooled = size.get() <= crate::device::staging::STAGING_CHUNK_SIZE;
-        let raw = if pooled {
-            device.staging_pool.acquire(device)?
+        let pooled = StagingClass::of(size.get());
+        let raw = if let Some(class) = pooled {
+            device.staging_pool.acquire(device, class)?
         } else {
             let stage_desc = hal::BufferDescriptor {
                 label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
@@ -1146,8 +1147,8 @@ impl StagingBuffer {
         let mapping = match unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) } {
             Ok(mapping) => mapping,
             Err(e) => {
-                if pooled {
-                    device.staging_pool.release(device, raw);
+                if let Some(class) = pooled {
+                    device.staging_pool.release(device, raw, class);
                 } else {
                     unsafe { device.raw().destroy_buffer(raw) };
                 }
@@ -1263,20 +1264,25 @@ pub struct FlushedStagingBuffer {
     raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
-    /// Whether the buffer is a chunk of the device's staging pool, which it
-    /// goes back to when dropped. Any other staging buffer is destroyed.
-    pooled: bool,
+    /// The class of the device's staging pool the buffer belongs to, which it
+    /// goes back to when dropped. A buffer of no class is destroyed.
+    pooled: Option<StagingClass>,
 }
 
 impl FlushedStagingBuffer {
-    /// The retired staging chunk `raw`, of `size` bytes, from `device`'s
-    /// staging pool.
-    pub(crate) fn pooled(raw: Box<dyn hal::DynBuffer>, device: Arc<Device>, size: u64) -> Self {
+    /// The retired staging buffer `raw`, of `size` bytes, from the `class` of
+    /// `device`'s staging pool.
+    pub(crate) fn pooled(
+        raw: Box<dyn hal::DynBuffer>,
+        device: Arc<Device>,
+        size: u64,
+        class: StagingClass,
+    ) -> Self {
         Self {
             raw: ManuallyDrop::new(raw),
             device,
             size: wgt::BufferSize::new(size).expect("a staging chunk holds bytes"),
-            pooled: true,
+            pooled: Some(class),
         }
     }
 
@@ -1289,9 +1295,9 @@ impl Drop for FlushedStagingBuffer {
     fn drop(&mut self) {
         // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        if self.pooled {
+        if let Some(class) = self.pooled {
             resource_log!("Release raw StagingBuffer to the staging pool");
-            self.device.staging_pool.release(&self.device, raw);
+            self.device.staging_pool.release(&self.device, raw, class);
         } else {
             resource_log!("Destroy raw StagingBuffer");
             unsafe { self.device.raw().destroy_buffer(raw) };
