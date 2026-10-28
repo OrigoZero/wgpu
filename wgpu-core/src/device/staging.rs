@@ -15,6 +15,15 @@
 //! A write larger than a whole chunk is staged in a buffer of its own,
 //! created for it and destroyed once its submission is done.
 //!
+//! Every other staging buffer the device maps for one copy (the one
+//! `Queue::create_staging_buffer` hands out for `Queue::write_buffer_with`,
+//! the initial contents of a buffer mapped at creation, the metadata of an
+//! indirect-draw validation pass) is a whole chunk from the same pool when its
+//! bytes fit in one, back in the pool once the submission that copies out of
+//! it is done ([`StagingBuffer::new`]).
+//!
+//! [`StagingBuffer::new`]: crate::resource::StagingBuffer::new
+//!
 //! [`PendingWrites`]: crate::device::queue::PendingWrites
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -62,7 +71,7 @@ impl StagingPool {
 
     /// A free chunk buffer, taken from the pool or, when the pool is empty,
     /// created on `device`.
-    fn acquire(&self, device: &Device) -> Result<Box<dyn hal::DynBuffer>, DeviceError> {
+    pub(crate) fn acquire(&self, device: &Device) -> Result<Box<dyn hal::DynBuffer>, DeviceError> {
         let (raw, idle) = self.free.lock().pop();
         let destroyed = idle.len() as isize;
         for raw in idle {

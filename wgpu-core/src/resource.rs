@@ -1094,8 +1094,9 @@ unsafe impl Sync for StagingBuffer {}
 /// A temporary buffer, consumed by the command that uses it.
 ///
 /// A [`StagingBuffer`] is designed for one-shot uploads of data to the GPU. It
-/// is always created mapped, and the command that uses it destroys the buffer
-/// when it is done.
+/// is always created mapped. One whose bytes fit in a staging chunk is a chunk
+/// of the device's staging pool, which it goes back to once the command that
+/// uses it is done; a larger one is created for its upload and destroyed then.
 ///
 /// [`StagingBuffer`]s can be created with [`queue_create_staging_buffer`] and
 /// used with [`queue_write_staging_buffer`]. They are also used internally by
@@ -1117,23 +1118,42 @@ pub struct StagingBuffer {
     pub(crate) size: wgt::BufferSize,
     is_coherent: bool,
     ptr: NonNull<u8>,
+    /// Whether the buffer is a chunk of the device's staging pool, which it
+    /// goes back to once the submission that copies out of it is done.
+    pooled: bool,
 }
 
 impl StagingBuffer {
+    /// A mapped staging buffer of `size` bytes: a chunk of the device's
+    /// staging pool when `size` fits in one, otherwise a buffer created for it.
     pub(crate) fn new(device: &Arc<Device>, size: wgt::BufferSize) -> Result<Self, DeviceError> {
         profiling::scope!("StagingBuffer::new");
-        let stage_desc = hal::BufferDescriptor {
-            label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
-            size: size.get(),
-            usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
-            memory_flags: hal::MemoryFlags::TRANSIENT,
+        let pooled = size.get() <= crate::device::staging::STAGING_CHUNK_SIZE;
+        let raw = if pooled {
+            device.staging_pool.acquire(device)?
+        } else {
+            let stage_desc = hal::BufferDescriptor {
+                label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
+                size: size.get(),
+                usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
+                memory_flags: hal::MemoryFlags::TRANSIENT,
+            };
+            let raw = unsafe { device.raw().create_buffer(&stage_desc) }
+                .map_err(|e| device.handle_hal_error(e))?;
+            device.counters.staging_buffer_creations.add(1);
+            raw
         };
-
-        let raw = unsafe { device.raw().create_buffer(&stage_desc) }
-            .map_err(|e| device.handle_hal_error(e))?;
-        device.counters.staging_buffer_creations.add(1);
-        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
-            .map_err(|e| device.handle_hal_error(e))?;
+        let mapping = match unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) } {
+            Ok(mapping) => mapping,
+            Err(e) => {
+                if pooled {
+                    device.staging_pool.release(device, raw);
+                } else {
+                    unsafe { device.raw().destroy_buffer(raw) };
+                }
+                return Err(device.handle_hal_error(e));
+            }
+        };
 
         let staging_buffer = StagingBuffer {
             raw,
@@ -1141,6 +1161,7 @@ impl StagingBuffer {
             size,
             is_coherent: mapping.is_coherent,
             ptr: mapping.ptr,
+            pooled,
         };
 
         Ok(staging_buffer)
@@ -1216,14 +1237,18 @@ impl StagingBuffer {
         unsafe { device.unmap_buffer(self.raw.as_ref()) };
 
         let StagingBuffer {
-            raw, device, size, ..
+            raw,
+            device,
+            size,
+            pooled,
+            ..
         } = self;
 
         FlushedStagingBuffer {
             raw: ManuallyDrop::new(raw),
             device,
             size,
-            pooled: false,
+            pooled,
         }
     }
 }

@@ -99,12 +99,14 @@ macro_rules! define_lock_ranks {
 define_lock_ranks! {
     rank COMMAND_BUFFER_DATA "CommandBuffer::data" followed by {
         DEVICE_SNATCHABLE_LOCK,
+        DEVICE_STAGING_POOL,
         DEVICE_USAGE_SCOPES,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
         BUFFER_MAP_STATE,
     }
     rank DEVICE_SNATCHABLE_LOCK "Device::snatchable_lock" followed by {
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+        DEVICE_STAGING_POOL,
         DEVICE_TRACE,
         BUFFER_MAP_STATE,
         // Uncomment this to see an interesting cycle.
@@ -112,6 +114,7 @@ define_lock_ranks! {
     }
     rank BUFFER_MAP_STATE "Buffer::map_state" followed by {
         QUEUE_PENDING_WRITES,
+        DEVICE_STAGING_POOL,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
         DEVICE_TRACE,
     }
