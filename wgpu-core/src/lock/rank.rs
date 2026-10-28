@@ -117,11 +117,13 @@ define_lock_ranks! {
     }
     rank QUEUE_PENDING_WRITES "Queue::pending_writes" followed by {
         COMMAND_ALLOCATOR_FREE_ENCODERS,
+        DEVICE_STAGING_POOL,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
         QUEUE_LIFE_TRACKER,
     }
     rank QUEUE_LIFE_TRACKER "Queue::life_tracker" followed by {
         COMMAND_ALLOCATOR_FREE_ENCODERS,
+        DEVICE_STAGING_POOL,
         DEVICE_TRACE,
     }
     rank COMMAND_ALLOCATOR_FREE_ENCODERS "CommandAllocator::free_encoders" followed by {
@@ -133,6 +135,7 @@ define_lock_ranks! {
     rank DEVICE_COMMAND_INDICES "Device::command_indices" followed by {}
     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by {}
     rank DEVICE_FENCE "Device::fence" followed by { }
+    rank DEVICE_STAGING_POOL "StagingPool::free" followed by { }
     rank DEVICE_TRACE "Device::trace" followed by { }
     rank DEVICE_TRACKERS "Device::trackers" followed by { }
     rank DEVICE_LOST_CLOSURE "Device::device_lost_closure" followed by { }
