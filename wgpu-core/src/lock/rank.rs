@@ -108,6 +108,7 @@ define_lock_ranks! {
     // Non-leaf ranks, in topological order.
     rank COMMAND_BUFFER_DATA "CommandBuffer::data" followed by {
         DEVICE_SNATCHABLE_LOCK,
+        DEVICE_STAGING_POOL,
         BUFFER_MAP_STATE,
         COMMAND_ALLOCATOR_FREE_ENCODERS,
         BUFFER_POOL,
@@ -118,6 +119,7 @@ define_lock_ranks! {
     }
     rank DEVICE_SNATCHABLE_LOCK "Device::snatchable_lock" followed by {
         BUFFER_MAP_STATE,
+        DEVICE_STAGING_POOL,
         DEVICE_COMMAND_INDICES,
         QUEUE_PENDING_WRITES,
         TEXTURE_INITIALIZATION_STATUS,
@@ -171,6 +173,7 @@ define_lock_ranks! {
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
     rank BUFFER_MAP_STATE "Buffer::map_state" followed by {
+        DEVICE_STAGING_POOL,
         DEVICE_TRACE,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
