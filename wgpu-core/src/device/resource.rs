@@ -216,6 +216,14 @@ pub struct Device {
 
     pub(crate) command_allocator: command::CommandAllocator,
 
+    /// The free chunks of staging memory the queue's writes are copied out
+    /// of.
+    pub(crate) staging_pool: super::staging::StagingPool,
+
+    /// The counts `wgpu-core` keeps for the device, reported in
+    /// [`wgt::InternalCounters::core`].
+    pub(crate) counters: wgt::CoreCounters,
+
     pub(crate) command_indices: RwLock<CommandIndices>,
 
     /// The index of the last successful submission to this device's
@@ -325,6 +333,7 @@ impl Drop for Device {
         if let Some(timestamp_normalizer) = self.timestamp_normalizer.take() {
             timestamp_normalizer.dispose(self.raw.as_ref());
         }
+        self.staging_pool.dispose(self.raw.as_ref());
         unsafe {
             self.raw.destroy_buffer(zero_buffer);
             self.raw.destroy_bind_group_layout(empty_bgl);
@@ -529,6 +538,8 @@ impl Device {
             ),
             label: desc.label.to_string(),
             command_allocator,
+            staging_pool: super::staging::StagingPool::new(),
+            counters: wgt::CoreCounters::default(),
             command_indices: RwLock::new(
                 rank::DEVICE_COMMAND_INDICES,
                 CommandIndices {
@@ -5268,6 +5279,10 @@ impl Device {
 
     pub fn get_hal_counters(&self) -> wgt::HalCounters {
         self.raw().get_internal_counters()
+    }
+
+    pub fn get_core_counters(&self) -> wgt::CoreCounters {
+        self.counters.clone()
     }
 
     pub fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport> {

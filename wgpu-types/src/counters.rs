@@ -144,7 +144,22 @@ pub struct HalCounters {
 /// `wgpu-core`'s part of [`InternalCounters`].
 #[derive(Clone, Default)]
 pub struct CoreCounters {
-    // TODO    #[cfg(features=)]
+    /// Number of staging buffers the device has created to carry data from
+    /// the host to the GPU: the buffers of `Queue::write_buffer`,
+    /// `Queue::write_texture` and `Queue::create_staging_buffer`, and the
+    /// ones holding the initial contents of a buffer mapped at creation. It
+    /// counts creations and only ever grows; a staging buffer the device
+    /// reuses from its pool is counted once, when it was created.
+    pub staging_buffer_creations: InternalCounter,
+    /// Number of staging buffers the device keeps in its pool, free for the
+    /// queue's next writes.
+    pub pooled_staging_buffers: InternalCounter,
+    /// Number of `Queue::write_buffer` calls the queue staged. It counts
+    /// calls and only ever grows.
+    pub buffer_writes: InternalCounter,
+    /// Number of `Queue::write_texture` calls the queue staged. It counts
+    /// calls and only ever grows.
+    pub texture_writes: InternalCounter,
 }
 
 /// All internal counters, exposed for debugging purposes.

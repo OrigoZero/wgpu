@@ -1131,6 +1131,7 @@ impl StagingBuffer {
 
         let raw = unsafe { device.raw().create_buffer(&stage_desc) }
             .map_err(|e| device.handle_hal_error(e))?;
+        device.counters.staging_buffer_creations.add(1);
         let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
             .map_err(|e| device.handle_hal_error(e))?;
 
@@ -1154,6 +1155,13 @@ impl StagingBuffer {
     #[cfg(feature = "trace")]
     pub(crate) fn get_data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.size.get() as usize) }
+    }
+
+    /// The buffer's bytes, mapped for writing.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: The buffer is mapped for its whole size until it is
+        // flushed, which consumes it.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size.get() as usize) }
     }
 
     pub(crate) fn write_zeros(&mut self) {
@@ -1215,6 +1223,7 @@ impl StagingBuffer {
             raw: ManuallyDrop::new(raw),
             device,
             size,
+            pooled: false,
         }
     }
 }
@@ -1222,14 +1231,30 @@ impl StagingBuffer {
 crate::impl_resource_type!(StagingBuffer);
 crate::impl_storage_item!(StagingBuffer);
 
+/// A staging buffer whose writes the device can see, held until the
+/// submission that copies out of it is done.
 #[derive(Debug)]
 pub struct FlushedStagingBuffer {
     raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
+    /// Whether the buffer is a chunk of the device's staging pool, which it
+    /// goes back to when dropped. Any other staging buffer is destroyed.
+    pooled: bool,
 }
 
 impl FlushedStagingBuffer {
+    /// The retired staging chunk `raw`, of `size` bytes, from `device`'s
+    /// staging pool.
+    pub(crate) fn pooled(raw: Box<dyn hal::DynBuffer>, device: Arc<Device>, size: u64) -> Self {
+        Self {
+            raw: ManuallyDrop::new(raw),
+            device,
+            size: wgt::BufferSize::new(size).expect("a staging chunk holds bytes"),
+            pooled: true,
+        }
+    }
+
     pub(crate) fn raw(&self) -> &dyn hal::DynBuffer {
         self.raw.as_ref()
     }
@@ -1237,10 +1262,15 @@ impl FlushedStagingBuffer {
 
 impl Drop for FlushedStagingBuffer {
     fn drop(&mut self) {
-        resource_log!("Destroy raw StagingBuffer");
         // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        unsafe { self.device.raw().destroy_buffer(raw) };
+        if self.pooled {
+            resource_log!("Release raw StagingBuffer to the staging pool");
+            self.device.staging_pool.release(&self.device, raw);
+        } else {
+            resource_log!("Destroy raw StagingBuffer");
+            unsafe { self.device.raw().destroy_buffer(raw) };
+        }
     }
 }
 
