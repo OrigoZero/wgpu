@@ -121,9 +121,14 @@ impl<T> TrimmedStack<T> {
     }
 
     /// How many items the stack holds.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Take every item out of the stack.
+    pub(crate) fn drain(&mut self) -> Vec<T> {
+        self.low_water = 0;
+        core::mem::take(&mut self.items)
     }
 }
 

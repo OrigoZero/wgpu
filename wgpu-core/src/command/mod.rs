@@ -78,7 +78,7 @@ pub(crate) use self::{
     },
 };
 
-pub(crate) use allocator::CommandAllocator;
+pub(crate) use allocator::{CommandAllocator, TrimmedStack};
 
 /// cbindgen:ignore
 pub use self::{compute_command::ComputeCommand, render_command::RenderCommand};

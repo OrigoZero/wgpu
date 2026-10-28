@@ -151,6 +151,7 @@ define_lock_ranks! {
         COMMAND_ALLOCATOR_FREE_ENCODERS,
         BUFFER_INITIALIZATION_STATUS,
         TEXTURE_INITIALIZATION_STATUS,
+        DEVICE_STAGING_POOL,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
     rank TEXTURE_INITIALIZATION_STATUS "Texture::initialization_status" followed by {
@@ -165,6 +166,7 @@ define_lock_ranks! {
         BUFFER_POOL,
         COMMAND_ALLOCATOR_FREE_ENCODERS,
         DEVICE_DEFERRED_DESTROY,
+        DEVICE_STAGING_POOL,
         DEVICE_TRACE,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
@@ -201,6 +203,7 @@ define_lock_ranks! {
     rank BUFFER_INITIALIZATION_STATUS "Buffer::initialization_status" followed by { }
     rank BUFFER_POOL "BufferPool::buffers" followed by { }
     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by { }
+    rank DEVICE_STAGING_POOL "StagingPool::free" followed by { }
     rank DEVICE_TRACE "Device::trace" followed by { }
     rank DEVICE_USAGE_SCOPES "Device::usage_scopes" followed by { }
     rank HUB_EXTERNAL_TEXTURES "Hub::external_textures" followed by { }

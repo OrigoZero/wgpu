@@ -13,7 +13,11 @@ use wgt::{
     AccelerationStructureFlags,
 };
 
-use super::{life::LifetimeTracker, Device};
+use super::{
+    life::LifetimeTracker,
+    staging::{StagingChunk, STAGING_CHUNK_SIZE},
+    Device,
+};
 #[cfg(feature = "trace")]
 use crate::device::trace::{Action, IntoTrace};
 use crate::{
@@ -392,10 +396,22 @@ pub(crate) struct PendingWrites {
     pub is_recording: bool,
 
     temp_resources: Vec<TempResource>,
+    /// The chunk of staging memory the writes recorded since the last
+    /// submission are copied out of, mapped and taking further writes.
+    staging: Option<StagingChunk>,
     dst_buffers: FastHashMap<TrackerIndex, Arc<Buffer>>,
     dst_textures: FastHashMap<TrackerIndex, Arc<Texture>>,
     copied_blas_s: FastHashMap<TrackerIndex, Arc<Blas>>,
     instance_flags: wgt::InstanceFlags,
+}
+
+/// Where a queue write's staged bytes lie.
+#[derive(Debug)]
+pub(crate) enum Staged {
+    /// At `offset` in the pending writes' open staging chunk.
+    Chunk { offset: wgt::BufferAddress },
+    /// At the start of a staging buffer of the write's own.
+    Dedicated(FlushedStagingBuffer),
 }
 
 impl PendingWrites {
@@ -407,6 +423,7 @@ impl PendingWrites {
             command_encoder,
             is_recording: false,
             temp_resources: Vec::new(),
+            staging: None,
             dst_buffers: FastHashMap::default(),
             dst_textures: FastHashMap::default(),
             copied_blas_s: FastHashMap::default(),
@@ -446,6 +463,79 @@ impl PendingWrites {
             .push(TempResource::StagingBuffer(buffer));
     }
 
+    /// Stage `size` bytes for a copy these pending writes record, at an
+    /// offset aligned to `alignment`, and have `fill` write them.
+    ///
+    /// A write no larger than [`STAGING_CHUNK_SIZE`] takes the next range of
+    /// the open staging chunk, opening a chunk from the device's staging pool
+    /// when there is none or the open one has no such range left. A larger
+    /// write is staged in a buffer of its own.
+    pub(crate) fn stage(
+        &mut self,
+        device: &Arc<Device>,
+        size: wgt::BufferSize,
+        alignment: wgt::BufferAddress,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Staged, DeviceError> {
+        if size.get() > STAGING_CHUNK_SIZE {
+            let mut staging_buffer = StagingBuffer::new(device, size)?;
+            fill(staging_buffer.bytes_mut());
+            return Ok(Staged::Dedicated(staging_buffer.flush()));
+        }
+        if let Some(chunk) = self.staging.as_mut() {
+            if let Some((offset, bytes)) = chunk.allocate(size.get(), alignment) {
+                fill(bytes);
+                return Ok(Staged::Chunk { offset });
+            }
+        }
+        let opened = StagingChunk::acquire(device)?;
+        if let Some(full) = self.staging.replace(opened) {
+            self.temp_resources
+                .push(TempResource::StagingBuffer(full.retire()));
+        }
+        let (offset, bytes) = self
+            .staging
+            .as_mut()
+            .and_then(|chunk| chunk.allocate(size.get(), alignment))
+            .expect("a write no larger than a chunk fits in an empty one");
+        fill(bytes);
+        Ok(Staged::Chunk { offset })
+    }
+
+    /// The encoder these pending writes record into, begun if it was not,
+    /// with the buffer `staged` lies in and the offset of its bytes there.
+    pub(crate) fn activate_staged<'a>(
+        &'a mut self,
+        staged: &'a Staged,
+    ) -> (
+        &'a mut dyn hal::DynCommandEncoder,
+        &'a dyn hal::DynBuffer,
+        wgt::BufferAddress,
+    ) {
+        self.activate();
+        let (source, offset) = match staged {
+            Staged::Chunk { offset } => (
+                self.staging
+                    .as_ref()
+                    .expect("a write staged in a chunk has the chunk open")
+                    .raw(),
+                *offset,
+            ),
+            Staged::Dedicated(staging_buffer) => (staging_buffer.raw(), 0),
+        };
+        (self.command_encoder.as_mut(), source, offset)
+    }
+
+    /// Keep the staging memory of `staged` until the submission that copies
+    /// out of it is done.
+    pub(crate) fn consume_staged(&mut self, staged: Staged) {
+        match staged {
+            // The open chunk is retired with the submission.
+            Staged::Chunk { .. } => {}
+            Staged::Dedicated(staging_buffer) => self.consume(staging_buffer),
+        }
+    }
+
     fn pre_submit(
         &mut self,
         command_allocator: &CommandAllocator,
@@ -454,6 +544,15 @@ impl PendingWrites {
         snatch_guard: &SnatchGuard,
     ) -> Result<Option<EncoderInFlight>, DeviceError> {
         if self.is_recording {
+            if let Some(chunk) = self.staging.take() {
+                if chunk.is_used() {
+                    self.temp_resources
+                        .push(TempResource::StagingBuffer(chunk.retire()));
+                } else {
+                    self.staging = Some(chunk);
+                }
+            }
+
             let pending_buffers = mem::take(&mut self.dst_buffers);
             let pending_textures = mem::take(&mut self.dst_textures);
             let pending_blas_s = mem::take(&mut self.copied_blas_s);
@@ -681,31 +780,36 @@ impl Queue {
             return Ok(());
         };
 
-        // Platform validation requires that the staging buffer always be
-        // freed, even if an error occurs. All paths from here must call
-        // `device.pending_writes.consume`.
-        let mut staging_buffer = StagingBuffer::new(&self.device, data_size)?;
-
-        let staging_buffer = {
-            profiling::scope!("copy");
-            staging_buffer.write(data);
-            staging_buffer.flush()
-        };
+        self.device.counters.buffer_writes.add(1);
 
         let snatch_guard = self.device.snatchable_lock.read();
         let mut pending_writes = self.pending_writes.lock();
 
+        // Platform validation requires that the staging memory always be
+        // kept until the submission, even if an error occurs. All paths from
+        // here must call `pending_writes.consume_staged`.
+        let staged = pending_writes.stage(
+            &self.device,
+            data_size,
+            wgt::COPY_BUFFER_ALIGNMENT,
+            |staging| {
+                profiling::scope!("copy");
+                staging.copy_from_slice(data);
+            },
+        )?;
+
         let result = self.write_staging_buffer_impl(
             &snatch_guard,
             &mut pending_writes,
-            &staging_buffer,
+            &staged,
+            data_size,
             buffer,
             buffer_offset,
         );
 
         drop(snatch_guard);
 
-        pending_writes.consume(staging_buffer);
+        pending_writes.consume_staged(staged);
 
         drop(pending_writes);
 
@@ -744,6 +848,8 @@ impl Queue {
         // be freed, even if an error occurs. All paths from here must call
         // `device.pending_writes.consume`.
         let staging_buffer = staging_buffer.flush();
+        let size = staging_buffer.size;
+        let staged = Staged::Dedicated(staging_buffer);
 
         let snatch_guard = self.device.snatchable_lock.read();
         let mut pending_writes = self.pending_writes.lock();
@@ -751,14 +857,15 @@ impl Queue {
         let result = self.write_staging_buffer_impl(
             &snatch_guard,
             &mut pending_writes,
-            &staging_buffer,
+            &staged,
+            size,
             buffer,
             buffer_offset,
         );
 
         drop(snatch_guard);
 
-        pending_writes.consume(staging_buffer);
+        pending_writes.consume_staged(staged);
 
         drop(pending_writes);
 
@@ -822,7 +929,8 @@ impl Queue {
         &self,
         snatch_guard: &SnatchGuard,
         pending_writes: &mut PendingWrites,
-        staging_buffer: &FlushedStagingBuffer,
+        staged: &Staged,
+        size: wgt::BufferSize,
         buffer: Arc<Buffer>,
         buffer_offset: u64,
     ) -> Result<(), QueueWriteError> {
@@ -839,15 +947,16 @@ impl Queue {
 
         self.same_device_as(buffer.as_ref())?;
 
-        self.validate_write_buffer_impl(&buffer, buffer_offset, staging_buffer.size.into())?;
+        self.validate_write_buffer_impl(&buffer, buffer_offset, size.get())?;
 
+        let (encoder, source, src_offset) = pending_writes.activate_staged(staged);
         let region = hal::BufferCopy {
-            src_offset: 0,
+            src_offset,
             dst_offset: buffer_offset,
-            size: staging_buffer.size,
+            size,
         };
         let barriers = iter::once(hal::BufferBarrier {
-            buffer: staging_buffer.raw(),
+            buffer: source,
             usage: hal::StateTransition {
                 from: wgt::BufferUses::MAP_WRITE,
                 to: wgt::BufferUses::COPY_SRC,
@@ -855,10 +964,9 @@ impl Queue {
         })
         .chain(transition.map(|pending| pending.into_hal(&buffer, snatch_guard)))
         .collect::<Vec<_>>();
-        let encoder = pending_writes.activate();
         unsafe {
             encoder.transition_buffers(&barriers);
-            encoder.copy_buffer_to_buffer(staging_buffer.raw(), dst_raw, &[region]);
+            encoder.copy_buffer_to_buffer(source, dst_raw, &[region]);
         }
 
         pending_writes.insert_buffer(&buffer);
@@ -869,7 +977,7 @@ impl Queue {
             buffer
                 .initialization_status
                 .write()
-                .drain(buffer_offset..(buffer_offset + staging_buffer.size.get()));
+                .drain(buffer_offset..(buffer_offset + size.get()));
         }
 
         Ok(())
@@ -946,6 +1054,8 @@ impl Queue {
             return Ok(());
         }
 
+        self.device.counters.texture_writes.add(1);
+
         let mut pending_writes = self.pending_writes.lock();
         let encoder = pending_writes.activate();
 
@@ -1013,18 +1123,28 @@ impl Queue {
         assert!(u32::MAX - bytes_in_last_row >= bytes_per_row_alignment);
         let stage_bytes_per_row = wgt::math::align_to(bytes_in_last_row, bytes_per_row_alignment);
 
-        // Platform validation requires that the staging buffer always be
-        // freed, even if an error occurs. All paths from here must call
-        // `device.pending_writes.consume`.
-        let staging_buffer = if stage_bytes_per_row == bytes_per_row {
-            profiling::scope!("copy aligned");
+        // The staged copy starts where the device copies a texture from a
+        // buffer at its fastest, on a whole texel block.
+        let stage_alignment = get_lowest_common_denom(
+            get_lowest_common_denom(
+                self.device.alignments.buffer_copy_offset.get() as u32,
+                block_size,
+            ),
+            wgt::COPY_BUFFER_ALIGNMENT as u32,
+        ) as wgt::BufferAddress;
+
+        // Platform validation requires that the staging memory always be
+        // kept until the submission, even if an error occurs. All paths from
+        // here must call `pending_writes.consume_staged`.
+        let staged = if stage_bytes_per_row == bytes_per_row {
             // Fast path if the data is already being aligned optimally.
             let stage_size = wgt::BufferSize::new(required_bytes_in_copy).unwrap();
-            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
-            staging_buffer.write(&data[data_layout.offset as usize..]);
-            staging_buffer
+            pending_writes.stage(&self.device, stage_size, stage_alignment, |staging| {
+                profiling::scope!("copy aligned");
+                let start = data_layout.offset as usize;
+                staging.copy_from_slice(&data[start..start + staging.len()]);
+            })?
         } else {
-            profiling::scope!("copy chunked");
             // Copy row by row into the optimal alignment.
             let block_rows_in_copy = u64::from(size.depth_or_array_layers - 1)
                 * u64::from(rows_per_image)
@@ -1035,48 +1155,46 @@ impl Queue {
                 .checked_mul(block_rows_in_copy)
                 .and_then(wgt::BufferSize::new)
                 .unwrap();
-            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
-            for layer in 0..u64::from(size.depth_or_array_layers) {
-                let rows_offset = layer * u64::from(rows_per_image);
-                for row in rows_offset..rows_offset + u64::from(height_in_blocks) {
-                    let src_offset = data_layout.offset + row * u64::from(bytes_per_row);
-                    let dst_offset = row * u64::from(stage_bytes_per_row);
-                    unsafe {
-                        staging_buffer.write_with_offset(
-                            data,
-                            src_offset as isize,
-                            dst_offset as isize,
-                            bytes_in_last_row as usize,
-                        )
+            pending_writes.stage(&self.device, stage_size, stage_alignment, |staging| {
+                profiling::scope!("copy chunked");
+                for layer in 0..u64::from(size.depth_or_array_layers) {
+                    let rows_offset = layer * u64::from(rows_per_image);
+                    for row in rows_offset..rows_offset + u64::from(height_in_blocks) {
+                        let src_offset =
+                            (data_layout.offset + row * u64::from(bytes_per_row)) as usize;
+                        let dst_offset = (row * u64::from(stage_bytes_per_row)) as usize;
+                        let row_size = bytes_in_last_row as usize;
+                        staging[dst_offset..dst_offset + row_size]
+                            .copy_from_slice(&data[src_offset..src_offset + row_size]);
                     }
                 }
-            }
-            staging_buffer
+            })?
         };
 
-        let staging_buffer = staging_buffer.flush();
-
-        let regions = (0..array_layer_count)
-            .map(|array_layer_offset| {
-                let mut texture_base = dst_base.clone();
-                texture_base.array_layer += array_layer_offset;
-                hal::BufferTextureCopy {
-                    buffer_layout: wgt::TexelCopyBufferLayout {
-                        offset: array_layer_offset as u64
-                            * rows_per_image as u64
-                            * stage_bytes_per_row as u64,
-                        bytes_per_row: Some(stage_bytes_per_row),
-                        rows_per_image: Some(rows_per_image),
-                    },
-                    texture_base,
-                    size: hal_copy_size,
-                }
-            })
-            .collect::<Vec<_>>();
-
         {
+            let (encoder, source, stage_offset) = pending_writes.activate_staged(&staged);
+
+            let regions = (0..array_layer_count)
+                .map(|array_layer_offset| {
+                    let mut texture_base = dst_base.clone();
+                    texture_base.array_layer += array_layer_offset;
+                    hal::BufferTextureCopy {
+                        buffer_layout: wgt::TexelCopyBufferLayout {
+                            offset: stage_offset
+                                + array_layer_offset as u64
+                                    * rows_per_image as u64
+                                    * stage_bytes_per_row as u64,
+                            bytes_per_row: Some(stage_bytes_per_row),
+                            rows_per_image: Some(rows_per_image),
+                        },
+                        texture_base,
+                        size: hal_copy_size,
+                    }
+                })
+                .collect::<Vec<_>>();
+
             let buffer_barrier = hal::BufferBarrier {
-                buffer: staging_buffer.raw(),
+                buffer: source,
                 usage: hal::StateTransition {
                     from: wgt::BufferUses::MAP_WRITE,
                     to: wgt::BufferUses::COPY_SRC,
@@ -1095,11 +1213,11 @@ impl Queue {
             unsafe {
                 encoder.transition_textures(&texture_barriers);
                 encoder.transition_buffers(&[buffer_barrier]);
-                encoder.copy_buffer_to_texture(staging_buffer.raw(), dst_raw, &regions);
+                encoder.copy_buffer_to_texture(source, dst_raw, &regions);
             }
         }
 
-        pending_writes.consume(staging_buffer);
+        pending_writes.consume_staged(staged);
         pending_writes.insert_texture(&dst);
 
         Ok(())
