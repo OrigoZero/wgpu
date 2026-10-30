@@ -1405,8 +1405,11 @@ impl Releasable {
 /// The allocations whose last Rust holder dropped since the queue's previous
 /// submit. A device shares one with its queue and with every buffer, texture
 /// and query set it creates. The queue destroys the contents right after each
-/// submit, once every command buffer recorded against them is with the queue,
-/// so the memory of a dropped allocation returns at the next submit.
+/// submit. A command encoder and the command buffer it finishes into hold
+/// every allocation they record, so an allocation joins the queue no earlier
+/// than the submit of the last command buffer that uses it, and its memory
+/// returns at the first submit after both its handle and that command buffer
+/// are gone.
 #[derive(Debug, Default)]
 struct ReleaseQueue {
     pending: RefCell<Vec<Releasable>>,
@@ -1427,7 +1430,8 @@ impl ReleaseQueue {
 
 /// Keeps an allocation alive for as long as any clone of it exists: the
 /// allocation's own handle holds one, and so does every texture view, bind
-/// group and render bundle that references the allocation, the way wgpu-core
+/// group and render bundle that references the allocation, and every command
+/// encoder and command buffer whose commands record it, the way wgpu-core
 /// holds a reference for each of those. Dropping the last clone hands the
 /// allocation to the release queue.
 #[derive(Debug)]
@@ -1453,6 +1457,63 @@ impl Drop for ReleaseOnDrop {
 
 /// A clone of the token of every allocation a bound resource reaches.
 type Holds = Vec<Rc<ReleaseOnDrop>>;
+
+/// The allocations a command encoder's recording references, each held once:
+/// the buffers, textures and query sets its commands and its passes name,
+/// and the bind groups and render bundles they bind, whose own holds reach
+/// the allocations behind them. The encoder and every pass it begins share
+/// one, the command buffer it finishes into takes it, and the queue drops
+/// that command buffer's right after the submit that consumes it, so an
+/// allocation recorded into an encoder stays alive until the command buffer
+/// carrying it is submitted, the way wgpu-core holds a reference from a
+/// command buffer to every resource it uses.
+#[derive(Debug, Default)]
+struct Recorded {
+    allocations: hashbrown::HashMap<usize, Rc<ReleaseOnDrop>>,
+    groups: hashbrown::HashMap<usize, Rc<Holds>>,
+}
+
+impl Recorded {
+    fn allocation(&mut self, token: &Rc<ReleaseOnDrop>) {
+        self.allocations
+            .entry(Rc::as_ptr(token) as usize)
+            .or_insert_with(|| token.clone());
+    }
+
+    fn buffer(&mut self, buffer: &WebBuffer) {
+        self.allocation(&buffer.release);
+    }
+
+    fn texture(&mut self, texture: &WebTexture) {
+        if let Some(token) = &texture.release {
+            self.allocation(token);
+        }
+    }
+
+    fn view(&mut self, view: &WebTextureView) {
+        if let Some(token) = &view.release {
+            self.allocation(token);
+        }
+    }
+
+    fn query_set(&mut self, query_set: &WebQuerySet) {
+        self.allocation(&query_set.release);
+    }
+
+    fn group(&mut self, holds: &Rc<Holds>) {
+        self.groups
+            .entry(Rc::as_ptr(holds) as usize)
+            .or_insert_with(|| holds.clone());
+    }
+
+    fn buffer_copy(&mut self, view: &crate::TexelCopyBufferInfo<'_>) {
+        self.buffer(view.buffer.inner.as_webgpu());
+    }
+
+    fn texture_copy(&mut self, view: &crate::TexelCopyTextureInfo<'_>) {
+        self.texture(view.texture.inner.as_webgpu());
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WebDevice {
@@ -1646,6 +1707,8 @@ pub struct WebCommandEncoder {
     pub(crate) inner: webgpu_sys::GpuCommandEncoder,
     /// Unique identifier for this CommandEncoder.
     ident: crate::cmp::Identifier,
+    /// The allocations recorded so far, by the encoder and its passes.
+    recorded: Rc<RefCell<Recorded>>,
 }
 
 #[derive(Debug)]
@@ -1653,6 +1716,8 @@ pub struct WebComputePassEncoder {
     pub(crate) inner: webgpu_sys::GpuComputePassEncoder,
     /// Unique identifier for this ComputePassEncoder.
     ident: crate::cmp::Identifier,
+    /// The recording of the encoder the pass was begun on.
+    recorded: Rc<RefCell<Recorded>>,
 }
 
 #[derive(Debug)]
@@ -1660,6 +1725,8 @@ pub struct WebRenderPassEncoder {
     pub(crate) inner: webgpu_sys::GpuRenderPassEncoder,
     /// Unique identifier for this RenderPassEncoder.
     ident: crate::cmp::Identifier,
+    /// The recording of the encoder the pass was begun on.
+    recorded: Rc<RefCell<Recorded>>,
 }
 
 #[derive(Debug)]
@@ -1667,6 +1734,10 @@ pub struct WebCommandBuffer {
     pub(crate) inner: webgpu_sys::GpuCommandBuffer,
     /// Unique identifier for this CommandBuffer.
     ident: crate::cmp::Identifier,
+    /// The allocations its commands reference, alive until it is submitted:
+    /// held for its drop, which hands each allocation it held last to the
+    /// release queue.
+    _recorded: Recorded,
 }
 
 #[derive(Debug, Clone)]
@@ -2647,6 +2718,7 @@ impl dispatch::DeviceInterface for WebDevice {
         WebCommandEncoder {
             inner: command_encoder,
             ident: crate::cmp::Identifier::create(),
+            recorded: Rc::default(),
         }
         .into()
     }
@@ -2923,6 +2995,12 @@ impl dispatch::QueueInterface for WebQueue {
             .collect::<js_sys::Array>();
 
         self.inner.submit(&array);
+        // The submitted command buffers let go of what they recorded, so an
+        // allocation whose last holder was one of them is destroyed with the
+        // rest: after the submit that uses it, which the browser completes
+        // before it frees the memory.
+        drop(array);
+        drop(temp_command_buffers);
         self.release_queue.destroy_pending();
 
         0
@@ -3190,6 +3268,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
     ) {
         let source = source.as_webgpu();
         let destination = destination.as_webgpu();
+        {
+            let mut recorded = self.recorded.borrow_mut();
+            recorded.buffer(source);
+            recorded.buffer(destination);
+        }
 
         if let Some(size) = copy_size {
             self.inner
@@ -3219,6 +3302,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         destination: crate::TexelCopyTextureInfo<'_>,
         copy_size: crate::Extent3d,
     ) {
+        {
+            let mut recorded = self.recorded.borrow_mut();
+            recorded.buffer_copy(&source);
+            recorded.texture_copy(&destination);
+        }
         self.inner
             .copy_buffer_to_texture_with_gpu_extent_3d_dict(
                 &map_buffer_copy_view(source),
@@ -3234,6 +3322,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         destination: crate::TexelCopyBufferInfo<'_>,
         copy_size: crate::Extent3d,
     ) {
+        {
+            let mut recorded = self.recorded.borrow_mut();
+            recorded.texture_copy(&source);
+            recorded.buffer_copy(&destination);
+        }
         self.inner
             .copy_texture_to_buffer_with_gpu_extent_3d_dict(
                 &map_texture_copy_view(source),
@@ -3249,6 +3342,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         destination: crate::TexelCopyTextureInfo<'_>,
         copy_size: crate::Extent3d,
     ) {
+        {
+            let mut recorded = self.recorded.borrow_mut();
+            recorded.texture_copy(&source);
+            recorded.texture_copy(&destination);
+        }
         self.inner
             .copy_texture_to_texture_with_gpu_extent_3d_dict(
                 &map_texture_copy_view(source),
@@ -3269,6 +3367,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
 
         if let Some(ref timestamp_writes) = desc.timestamp_writes {
             let query_set = timestamp_writes.query_set.inner.as_webgpu();
+            self.recorded.borrow_mut().query_set(query_set);
             let writes = webgpu_sys::GpuComputePassTimestampWrites::new(&query_set.inner);
             if let Some(index) = timestamp_writes.beginning_of_pass_write_index {
                 writes.set_beginning_of_pass_write_index(index);
@@ -3284,6 +3383,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         WebComputePassEncoder {
             inner: compute_pass,
             ident: crate::cmp::Identifier::create(),
+            recorded: self.recorded.clone(),
         }
         .into()
     }
@@ -3292,6 +3392,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         &self,
         desc: &crate::RenderPassDescriptor<'_>,
     ) -> dispatch::DispatchRenderPass {
+        let mut recorded = self.recorded.borrow_mut();
         let mapped_color_attachments = desc
             .color_attachments
             .iter()
@@ -3313,6 +3414,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                         crate::LoadOp::Load => webgpu_sys::GpuLoadOp::Load,
                     };
 
+                    recorded.view(ca.view.inner.as_webgpu());
                     let view = &ca.view.inner.as_webgpu().inner;
 
                     let mapped_color_attachment = webgpu_sys::GpuRenderPassColorAttachment::new(
@@ -3324,6 +3426,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                         mapped_color_attachment.set_clear_value(&cv);
                     }
                     if let Some(rt) = ca.resolve_target {
+                        recorded.view(rt.inner.as_webgpu());
                         let resolve_target_view = &rt.inner.as_webgpu().inner;
                         mapped_color_attachment.set_resolve_target(resolve_target_view);
                     }
@@ -3342,6 +3445,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         }
 
         if let Some(dsa) = &desc.depth_stencil_attachment {
+            recorded.view(dsa.view.inner.as_webgpu());
             let depth_stencil_attachment = &dsa.view.inner.as_webgpu().inner;
             let mapped_depth_stencil_attachment =
                 webgpu_sys::GpuRenderPassDepthStencilAttachment::new(depth_stencil_attachment);
@@ -3383,6 +3487,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         }
 
         if let Some(ref timestamp_writes) = desc.timestamp_writes {
+            recorded.query_set(timestamp_writes.query_set.inner.as_webgpu());
             let query_set = &timestamp_writes.query_set.inner.as_webgpu().inner;
             let writes = webgpu_sys::GpuRenderPassTimestampWrites::new(query_set);
             if let Some(index) = timestamp_writes.beginning_of_pass_write_index {
@@ -3394,11 +3499,13 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
             mapped_desc.set_timestamp_writes(&writes);
         }
 
+        drop(recorded);
         let render_pass = self.inner.begin_render_pass(&mapped_desc).unwrap();
 
         WebRenderPassEncoder {
             inner: render_pass,
             ident: crate::cmp::Identifier::create(),
+            recorded: self.recorded.clone(),
         }
         .into()
     }
@@ -3417,6 +3524,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         WebCommandBuffer {
             inner: buffer,
             ident: crate::cmp::Identifier::create(),
+            _recorded: core::mem::take(&mut *self.recorded.borrow_mut()),
         }
         .into()
     }
@@ -3436,6 +3544,7 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         size: Option<crate::BufferAddress>,
     ) {
         let buffer = buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
 
         match size {
             Some(size) => {
@@ -3474,6 +3583,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
         destination: &dispatch::DispatchBuffer,
         destination_offset: crate::BufferAddress,
     ) {
+        {
+            let mut recorded = self.recorded.borrow_mut();
+            recorded.query_set(query_set.as_webgpu());
+            recorded.buffer(destination.as_webgpu());
+        }
         let query_set = &query_set.as_webgpu().inner;
         let destination = &destination.as_webgpu().inner;
 
@@ -3543,6 +3657,11 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
+        if let Some(bind_group) = bind_group {
+            self.recorded
+                .borrow_mut()
+                .group(&bind_group.as_webgpu().holds);
+        }
         let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
 
         if offsets.is_empty() {
@@ -3603,6 +3722,7 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
         indirect_offset: crate::BufferAddress,
     ) {
         let indirect_buffer = indirect_buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(indirect_buffer);
 
         self.inner
             .dispatch_workgroups_indirect_with_f64(&indirect_buffer.inner, indirect_offset as f64);
@@ -3627,6 +3747,11 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         bind_group: Option<&dispatch::DispatchBindGroup>,
         offsets: &[crate::DynamicOffset],
     ) {
+        if let Some(bind_group) = bind_group {
+            self.recorded
+                .borrow_mut()
+                .group(&bind_group.as_webgpu().holds);
+        }
         let bind_group = bind_group.map(|bind_group| &bind_group.as_webgpu().inner);
 
         if offsets.is_empty() {
@@ -3652,6 +3777,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         size: Option<crate::BufferSize>,
     ) {
         let buffer = buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
         let index_format = map_index_format(index_format);
 
         if let Some(size) = size {
@@ -3675,6 +3801,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         size: Option<crate::BufferSize>,
     ) {
         let buffer = buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
 
         if let Some(size) = size {
             self.inner.set_vertex_buffer_with_f64_and_f64(
@@ -3751,6 +3878,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         indirect_offset: crate::BufferAddress,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
         self.inner
             .draw_indirect_with_f64(&buffer.inner, indirect_offset as f64);
     }
@@ -3761,6 +3889,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         indirect_offset: crate::BufferAddress,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
         self.inner
             .draw_indexed_indirect_with_f64(&buffer.inner, indirect_offset as f64);
     }
@@ -3780,6 +3909,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         count: u32,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
 
         for i in 0..count {
             let offset = indirect_offset + i as crate::BufferAddress * 16;
@@ -3795,6 +3925,7 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         count: u32,
     ) {
         let buffer = indirect_buffer.as_webgpu();
+        self.recorded.borrow_mut().buffer(buffer);
 
         for i in 0..count {
             let offset = indirect_offset + i as crate::BufferAddress * 20;
@@ -3887,9 +4018,15 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         &mut self,
         render_bundles: &mut dyn Iterator<Item = &dispatch::DispatchRenderBundle>,
     ) {
+        let mut recorded = self.recorded.borrow_mut();
         let mapped = render_bundles
-            .map(|bundle| &bundle.as_webgpu().inner)
+            .map(|bundle| {
+                let bundle = bundle.as_webgpu();
+                recorded.group(&bundle.holds);
+                &bundle.inner
+            })
             .collect::<js_sys::Array>();
+        drop(recorded);
         self.inner.execute_bundles(&mapped);
     }
 }
