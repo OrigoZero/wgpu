@@ -2976,6 +2976,9 @@ impl super::Adapter {
             mem_allocator: Mutex::new(mem_allocator),
             desc_allocator: Mutex::new(desc_allocator),
             valid_ash_memory_types,
+            dedicated_images: core::sync::atomic::AtomicU32::new(0),
+            dedicated_image_budget: self.phd_capabilities.properties.limits.max_memory_allocation_count
+                / super::DEDICATED_IMAGE_SHARE_OF_ALLOCATIONS,
             naga_options,
             #[cfg(feature = "renderdoc")]
             render_doc: Default::default(),
