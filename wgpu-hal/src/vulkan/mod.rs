@@ -61,6 +61,10 @@ use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
 
 const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;
 
+/// The size from which an image is given device memory of its own rather than
+/// a range of a block the allocator shares between resources.
+const DEDICATED_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Api;
 
