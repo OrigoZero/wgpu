@@ -1526,6 +1526,26 @@ pub struct WebDevice {
     release_queue: Rc<ReleaseQueue>,
 }
 
+impl WebDevice {
+    /// Whether this device hands back a mapping for a buffer mapped at
+    /// creation: one of four bytes, the smallest a buffer is, is created
+    /// mapped and destroyed again.
+    fn maps_at_creation(&self) -> bool {
+        let probe = webgpu_sys::GpuBufferDescriptor::new(
+            4.0,
+            (wgt::BufferUsages::MAP_WRITE | wgt::BufferUsages::COPY_SRC).bits(),
+        );
+        probe.set_mapped_at_creation(true);
+        match self.inner.create_buffer(&probe) {
+            Ok(buffer) => {
+                buffer.destroy();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebQueue {
     pub(crate) inner: webgpu_sys::GpuQueue,
@@ -1611,6 +1631,20 @@ impl WebBuffer {
             ident: crate::cmp::Identifier::create(),
             release,
         }
+    }
+
+    /// A web buffer for `inner`, created unmapped on a device that has lost
+    /// its connection to the GPU, holding the mapping `desc` asked to be
+    /// created with: an `ArrayBuffer` of the buffer's size that its mapped
+    /// ranges read and write.
+    fn with_detached_mapping(
+        inner: webgpu_sys::GpuBuffer,
+        desc: &crate::BufferDescriptor<'_>,
+        release_queue: &Rc<ReleaseQueue>,
+    ) -> Self {
+        let buffer = Self::new(inner, desc, release_queue);
+        buffer.mapping.borrow_mut().mapped_buffer = Some(js_sys::ArrayBuffer::new(desc.size as u32));
+        buffer
     }
 
     /// Obtains a reference to the re-usable buffer mapping as a Javascript array view.
@@ -2595,12 +2629,32 @@ impl dispatch::DeviceInterface for WebDevice {
         if let Some(label) = desc.label {
             mapped_desc.set_label(label);
         }
-        WebBuffer::new(
-            self.inner.create_buffer(&mapped_desc).unwrap(),
-            desc,
-            &self.release_queue,
-        )
-        .into()
+        let refusal = match self.inner.create_buffer(&mapped_desc) {
+            Ok(buffer) => return WebBuffer::new(buffer, desc, &self.release_queue).into(),
+            Err(refusal) => refusal,
+        };
+        // A browser refuses a buffer mapped at creation with a `RangeError`
+        // when it cannot hand back the buffer's mapping. Chromium does that
+        // for every such buffer, whatever its size, once the device has lost
+        // its connection to the GPU process (the GPU process crashed or was
+        // reclaimed): the device is lost, and its unmapped buffers, textures
+        // and submits are still accepted as the no-ops the WebGPU
+        // specification makes them. A device that cannot map the smallest
+        // buffer is that device, and its buffer is created unmapped and
+        // handed a mapping of its own, as the specification hands a lost
+        // device's buffer one: the writes land in it and reach no GPU, which
+        // is all a lost device's resources ever do. A device that maps the
+        // smallest buffer refused this one for its size, which is an
+        // allocation failure.
+        if !desc.mapped_at_creation || self.maps_at_creation() {
+            panic!(
+                "GPUDevice.createBuffer refused a buffer of {} bytes (mapped at creation: {}): {:?}",
+                desc.size, desc.mapped_at_creation, refusal
+            );
+        }
+        mapped_desc.set_mapped_at_creation(false);
+        let buffer = self.inner.create_buffer(&mapped_desc).unwrap();
+        WebBuffer::with_detached_mapping(buffer, desc, &self.release_queue).into()
     }
 
     fn create_texture(&self, desc: &crate::TextureDescriptor<'_>) -> dispatch::DispatchTexture {
