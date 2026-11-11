@@ -61,6 +61,16 @@ use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
 
 const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;
 
+/// The size from which an image is given device memory of its own rather than
+/// a range of a block the allocator shares between resources.
+const DEDICATED_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The share of the device's `maxMemoryAllocationCount` dedicated images may
+/// hold at once: an image past it takes a range of a shared block, so the
+/// allocations every other resource and the shared blocks need stay within
+/// the device's count.
+const DEDICATED_IMAGE_SHARE_OF_ALLOCATIONS: u32 = 4;
+
 #[derive(Clone, Debug)]
 pub struct Api;
 
@@ -530,6 +540,9 @@ pub struct Device {
     desc_allocator:
         Mutex<gpu_descriptor::DescriptorAllocator<vk::DescriptorPool, vk::DescriptorSet>>,
     valid_ash_memory_types: u32,
+    /// How many images hold device memory of their own now, and how many may.
+    dedicated_images: core::sync::atomic::AtomicU32,
+    dedicated_image_budget: u32,
     naga_options: naga::back::spv::Options<'static>,
     #[cfg(feature = "renderdoc")]
     render_doc: crate::auxil::renderdoc::RenderDoc,

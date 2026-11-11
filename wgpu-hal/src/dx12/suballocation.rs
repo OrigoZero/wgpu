@@ -92,6 +92,12 @@ mod gpu_allocator_bridge {
     }
 }
 
+
+/// The size from which a texture is a committed resource with a heap of its
+/// own rather than a placed one in a heap the allocator shares between
+/// resources.
+const DEDICATED_TEXTURE_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) enum AllocationType {
     Buffer,
@@ -289,7 +295,13 @@ impl<'a> DeviceAllocationContext<'a> {
         let allocation_info =
             self.error_if_would_oom_on_resource_allocation(&raw_desc, location)?;
 
-        let (resource, allocation) = if self.shared.private_caps.suballocation_supported {
+        // A texture of at least `DEDICATED_TEXTURE_BYTES` is a committed
+        // resource, with a heap of its own, so destroying it gives that memory
+        // back rather than leaving a hole in a heap the allocator keeps while
+        // anything else sits in it.
+        let (resource, allocation) = if self.shared.private_caps.suballocation_supported
+            && allocation_info.SizeInBytes < DEDICATED_TEXTURE_BYTES
+        {
             self.create_placed_texture(desc, raw_desc, allocation_info, location)?
         } else {
             self.create_committed_texture(desc, raw_desc)?

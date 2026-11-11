@@ -1112,6 +1112,21 @@ impl crate::Device for super::Device {
 
         let name = desc.label.unwrap_or("Unlabeled texture");
 
+        // An image of at least `DEDICATED_IMAGE_BYTES` takes device memory of
+        // its own, so destroying it gives that memory back rather than leaving
+        // a hole in a block the allocator keeps while anything else sits in
+        // it, while dedicated images hold fewer than their share of the
+        // device's allocation count.
+        let dedicated = image.requirements.size >= super::DEDICATED_IMAGE_BYTES
+            && self
+                .dedicated_images
+                .fetch_update(
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |held| (held < self.dedicated_image_budget).then_some(held + 1),
+                )
+                .is_ok();
+
         let allocation = self
             .mem_allocator
             .lock()
@@ -1124,9 +1139,16 @@ impl crate::Device for super::Device {
                 },
                 location: gpu_allocator::MemoryLocation::GpuOnly,
                 linear: false,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                allocation_scheme: if dedicated {
+                    gpu_allocator::vulkan::AllocationScheme::DedicatedImage(image.raw)
+                } else {
+                    gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged
+                },
             })
             .inspect_err(|_| {
+                if dedicated {
+                    self.dedicated_images.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 unsafe { self.shared.raw.destroy_image(image.raw, None) };
             })?;
 
@@ -1160,6 +1182,9 @@ impl crate::Device for super::Device {
         match texture.memory {
             super::TextureMemory::Allocation(allocation) => {
                 self.counters.texture_memory.sub(allocation.size() as isize);
+                if allocation.is_dedicated() {
+                    self.dedicated_images.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 let result = self.mem_allocator.lock().free(allocation);
                 if let Err(err) = result {
                     log::warn!("Failed to free texture allocation: {err}");
