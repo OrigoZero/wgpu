@@ -373,9 +373,61 @@ fn compile_dxc(
 ) -> Result<crate::dx12::CompiledShader, crate::PipelineError> {
     profiling::scope!("compile_dxc");
 
-    let source_name = source_name.and_then(|cstr| cstr.to_str().ok());
+    let debug = device
+        .shared
+        .private_caps
+        .instance_flags
+        .contains(wgt::InstanceFlags::DEBUG)
+        && !device
+            .shared
+            .private_caps
+            .workarounds
+            .avoid_shader_debug_info;
+    let compile_res = compile_dxc_source(
+        source,
+        source_name,
+        raw_ep,
+        full_stage,
+        compiler,
+        debug,
+        device.features.contains(wgt::Features::SHADER_F16),
+    )?;
 
-    let source_name = source_name.map(OPCWSTR::new);
+    let err_blob = get_output::<Dxc::IDxcBlobUtf8>(&compile_res, Dxc::DXC_OUT_ERRORS)?;
+
+    let len = unsafe { err_blob.GetStringLength() };
+    if len != 0 {
+        let err = as_err_str(&err_blob)?;
+        let label = source_name
+            .and_then(|name| name.to_str().ok())
+            .unwrap_or("unnamed");
+        return Err(crate::PipelineError::Linkage(
+            stage_bit,
+            format!("DXC compile error in shader {label:?}: {err}"),
+        ));
+    }
+
+    let blob = get_output::<Dxc::IDxcBlob>(&compile_res, Dxc::DXC_OUT_OBJECT)?;
+
+    Ok(crate::dx12::CompiledShader::Dxc(blob))
+}
+
+fn compile_dxc_source(
+    source: &str,
+    source_name: Option<&CStr>,
+    raw_ep: &str,
+    full_stage: &str,
+    compiler: &Dxc::IDxcCompiler3,
+    debug: bool,
+    shader_f16: bool,
+) -> Result<Dxc::IDxcResult, crate::DeviceError> {
+    // DXC interprets its source name as a command-line filename.
+    let source_name = source_name.map(|label| {
+        use core::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        label.to_bytes().hash(&mut hash);
+        OPCWSTR::new(&format!("wgpu-{:016x}.hlsl", hash.finish()))
+    });
     let raw_ep = OPCWSTR::new(raw_ep);
     let full_stage = OPCWSTR::new(full_stage);
 
@@ -396,22 +448,12 @@ fn compile_dxc(
         Dxc::DXC_ARG_ENABLE_STRICTNESS,
     ]);
 
-    if device
-        .shared
-        .private_caps
-        .instance_flags
-        .contains(wgt::InstanceFlags::DEBUG)
-        && !device
-            .shared
-            .private_caps
-            .workarounds
-            .avoid_shader_debug_info
-    {
+    if debug {
         compile_args.push(Dxc::DXC_ARG_DEBUG);
         compile_args.push(Dxc::DXC_ARG_SKIP_OPTIMIZATIONS);
     }
 
-    if device.features.contains(wgt::Features::SHADER_F16) {
+    if shader_f16 {
         compile_args.push(windows::core::w!("-enable-16bit-types"));
     }
 
@@ -430,18 +472,69 @@ fn compile_dxc(
     drop(raw_ep);
     drop(full_stage);
 
-    let err_blob = get_output::<Dxc::IDxcBlobUtf8>(&compile_res, Dxc::DXC_OUT_ERRORS)?;
+    Ok(compile_res)
+}
 
-    let len = unsafe { err_blob.GetStringLength() };
-    if len != 0 {
-        let err = as_err_str(&err_blob)?;
-        return Err(crate::PipelineError::Linkage(
-            stage_bit,
-            format!("DXC compile error: {err}"),
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires DXC; set WGPU_TEST_DXC_PATH or place dxcompiler.dll on PATH"]
+    fn dxc_compiles_buffer_source_with_arbitrary_labels() {
+        let path = std::env::var_os("WGPU_TEST_DXC_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("dxcompiler.dll"));
+        let CompilerContainer::DynamicDxc(container) =
+            CompilerContainer::new_dynamic_dxc(path).unwrap()
+        else {
+            unreachable!();
+        };
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        let long_label = "x".repeat(1024);
+        for label in [
+            "ordinary",
+            "zero::scan",
+            "a/b\\c",
+            "-T",
+            "@response",
+            "shader with spaces",
+            "",
+            "shader-\u{4e16}\u{754c}",
+            long_label.as_str(),
+        ] {
+            let label = std::ffi::CString::new(label).unwrap();
+            let result = compile_dxc_source(
+                source,
+                Some(&label),
+                "main",
+                "cs_6_0",
+                &container.compiler,
+                false,
+                false,
+            )
+            .unwrap();
+            let errors = get_output::<Dxc::IDxcBlobUtf8>(&result, Dxc::DXC_OUT_ERRORS).unwrap();
+            let message = if unsafe { errors.GetStringLength() } == 0 {
+                ""
+            } else {
+                as_err_str(&errors).unwrap()
+            };
+            assert_eq!(message, "", "label {label:?}");
+            let object = get_output::<Dxc::IDxcBlob>(&result, Dxc::DXC_OUT_OBJECT).unwrap();
+            assert!(unsafe { object.GetBufferSize() } > 0);
+        }
+        let invalid = compile_dxc_source(
+            "this is invalid HLSL",
+            Some(c"zero::scan"),
+            "main",
+            "cs_6_0",
+            &container.compiler,
+            false,
+            false,
+        )
+        .unwrap();
+        let errors = get_output::<Dxc::IDxcBlobUtf8>(&invalid, Dxc::DXC_OUT_ERRORS).unwrap();
+        assert!(unsafe { errors.GetStringLength() } > 0);
     }
-
-    let blob = get_output::<Dxc::IDxcBlob>(&compile_res, Dxc::DXC_OUT_OBJECT)?;
-
-    Ok(crate::dx12::CompiledShader::Dxc(blob))
 }
