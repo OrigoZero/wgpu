@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### Bug Fixes
+
+#### DX12
+
+- Compile in-memory shaders with arbitrary labels through DXC, including namespace separators, paths, and command-line-like text. Compiler errors retain the original shader label.
+
 ### New Features
 
 #### General
