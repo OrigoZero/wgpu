@@ -4486,6 +4486,12 @@ mod rgba16float_probe {
     /// browser (e.g. Firefox, <https://bugzilla.mozilla.org/show_bug.cgi?id=1834395>)
     /// adds support, with no wgpu change required.
     static RGBA16FLOAT_CANVAS_SUPPORT: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
+    /// Cached result of probing whether this browser applies `"extended"` tone
+    /// mapping to an `rgba16float` canvas: the canvas's `getConfiguration()`
+    /// reads back the `toneMapping` mode it was configured with. A browser that
+    /// does not know the `toneMapping` member drops it, reads back `"standard"`
+    /// or no tone mapping at all, and clamps the canvas to `[0, 1]`.
+    static EXTENDED_TONE_MAPPING_SUPPORT: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
     const PROBE_UNKNOWN: u8 = 0;
     const PROBE_UNSUPPORTED: u8 = 1;
     const PROBE_SUPPORTED: u8 = 2;
@@ -4498,6 +4504,14 @@ mod rgba16float_probe {
     /// device exists on a browser that rejects it.
     pub(super) fn rgba16float_canvas_supported() -> bool {
         RGBA16FLOAT_CANVAS_SUPPORT.load(Ordering::Relaxed) != PROBE_UNSUPPORTED
+    }
+
+    /// Whether `Surface::get_capabilities` should advertise the extended-range
+    /// color spaces on `Rgba16Float`: only once the probe has read back
+    /// `"extended"` tone mapping from a configured canvas, since a browser that
+    /// ignores it presents the canvas clamped to SDR without any error.
+    pub(super) fn extended_tone_mapping_supported() -> bool {
+        EXTENDED_TONE_MAPPING_SUPPORT.load(Ordering::Relaxed) == PROBE_SUPPORTED
     }
 
     /// Probe (once, then cache) whether this browser can configure a `rgba16float`
@@ -4513,22 +4527,33 @@ mod rgba16float_probe {
         }
         // If the probe can't run (e.g. no `OffscreenCanvas`), leave the support
         // state unknown so we keep advertising the format optimistically.
-        let Some(supported) = try_configure_rgba16float_canvas(device) else {
+        let Some(probe) = try_configure_rgba16float_canvas(device) else {
             return;
         };
-        RGBA16FLOAT_CANVAS_SUPPORT.store(
+        let state = |supported: bool| {
             if supported {
                 PROBE_SUPPORTED
             } else {
                 PROBE_UNSUPPORTED
-            },
-            Ordering::Relaxed,
-        );
+            }
+        };
+        RGBA16FLOAT_CANVAS_SUPPORT.store(state(probe.configured), Ordering::Relaxed);
+        EXTENDED_TONE_MAPPING_SUPPORT.store(state(probe.extended_tone_mapping), Ordering::Relaxed);
     }
 
-    /// Returns `Some(true)`/`Some(false)` if a `rgba16float` canvas could/couldn't
-    /// be configured, or `None` if the probe itself couldn't be set up.
-    fn try_configure_rgba16float_canvas(device: &webgpu_sys::GpuDevice) -> Option<bool> {
+    /// What configuring a throwaway `rgba16float` canvas with `"extended"` tone
+    /// mapping found.
+    struct CanvasProbe {
+        /// Whether `configure` accepted the `rgba16float` format.
+        configured: bool,
+        /// Whether the configured canvas reads back `"extended"` tone mapping.
+        extended_tone_mapping: bool,
+    }
+
+    /// Configure a throwaway 1x1 `rgba16float` canvas with `"extended"` tone
+    /// mapping and read its configuration back; `None` if the probe itself
+    /// couldn't be set up.
+    fn try_configure_rgba16float_canvas(device: &webgpu_sys::GpuDevice) -> Option<CanvasProbe> {
         let canvas = web_sys::OffscreenCanvas::new(1, 1).ok()?;
         let context = canvas.get_context("webgpu").ok()??;
         let context: webgpu_sys::GpuCanvasContext = context.unchecked_into();
@@ -4536,12 +4561,40 @@ mod rgba16float_probe {
             device,
             map_texture_format(wgt::TextureFormat::Rgba16Float),
         );
-        let supported = context.configure(&config).is_ok();
-        if supported {
+        let tone_mapping = webgpu_sys::GpuCanvasToneMapping::new();
+        tone_mapping.set_mode(webgpu_sys::GpuCanvasToneMappingMode::Extended);
+        config.set_tone_mapping(&tone_mapping);
+        let configured = context.configure(&config).is_ok();
+        let extended_tone_mapping =
+            configured && configured_tone_mapping_mode(&context).as_deref() == Some("extended");
+        if configured {
             // Leave the throwaway context unconfigured before it's dropped.
             context.unconfigure();
         }
-        Some(supported)
+        Some(CanvasProbe {
+            configured,
+            extended_tone_mapping,
+        })
+    }
+
+    /// The `toneMapping.mode` a configured canvas context reads back through
+    /// `getConfiguration()`; `None` where the browser has no
+    /// `getConfiguration`, or its answer holds no tone mapping mode. The method
+    /// is looked up and called by reflection, so a browser without it answers
+    /// `None` instead of throwing.
+    fn configured_tone_mapping_mode(context: &webgpu_sys::GpuCanvasContext) -> Option<String> {
+        let get_configuration =
+            js_sys::Reflect::get(context, &JsValue::from_str("getConfiguration")).ok()?;
+        let get_configuration = get_configuration.dyn_into::<js_sys::Function>().ok()?;
+        let configuration = get_configuration.call0(context).ok()?;
+        let tone_mapping =
+            js_sys::Reflect::get(&configuration, &JsValue::from_str("toneMapping")).ok()?;
+        if tone_mapping.is_undefined() || tone_mapping.is_null() {
+            return None;
+        }
+        js_sys::Reflect::get(&tone_mapping, &JsValue::from_str("mode"))
+            .ok()?
+            .as_string()
     }
 }
 
@@ -4584,15 +4637,20 @@ impl dispatch::SurfaceInterface for WebSurface {
                     // independent of the display: an SDR display clamps the
                     // out-of-range values rather than rejecting the config (and
                     // `configure` here never gates on display HDR state either).
-                    // So these spaces are gated on fp16-canvas support alone —
-                    // the same condition that puts `Rgba16Float` in `formats` —
-                    // not on whether the display is currently HDR, which is what
-                    // `display_hdr_info` reports. WebGPU has no linear canvas
+                    // So these spaces are gated on fp16-canvas support (the
+                    // condition that puts `Rgba16Float` in `formats`) and on the
+                    // browser applying "extended" tone mapping, which the probe
+                    // reads back from a configured canvas (a browser that drops
+                    // the `toneMapping` member clamps the canvas to SDR with no
+                    // error), not on whether the display is currently HDR, which
+                    // is what `display_hdr_info` reports. WebGPU has no linear canvas
                     // color space, so the web backend advertises the encoded
                     // `ExtendedSrgb` and, for the "display-p3" canvas, the
                     // wide-gamut `ExtendedDisplayP3` — not the linear
                     // `ExtendedSrgbLinear`.
-                    if format == wgt::TextureFormat::Rgba16Float {
+                    if format == wgt::TextureFormat::Rgba16Float
+                        && rgba16float_probe::extended_tone_mapping_supported()
+                    {
                         color_spaces |= wgt::SurfaceColorSpaces::EXTENDED_SRGB
                             | wgt::SurfaceColorSpaces::EXTENDED_DISPLAY_P3;
                     }
