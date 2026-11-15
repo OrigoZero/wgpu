@@ -3,6 +3,66 @@ use arrayvec::ArrayVec;
 use ash::vk;
 use hashbrown::{HashMap, HashSet};
 
+/// The descriptor pool calls [`DescriptorAllocator`] makes on a device.
+///
+/// `ash::Device` answers them with the driver's own calls; the allocator's
+/// tests answer them the way a driver does, including the failures a driver
+/// returns from a pool that still has room.
+pub trait PoolDevice {
+    /// `vkCreateDescriptorPool`.
+    unsafe fn create_pool(
+        &self,
+        info: &vk::DescriptorPoolCreateInfo<'_>,
+    ) -> Result<vk::DescriptorPool, vk::Result>;
+    /// `vkDestroyDescriptorPool`.
+    unsafe fn destroy_pool(&self, pool: vk::DescriptorPool);
+    /// `vkResetDescriptorPool`, which frees every set the pool holds.
+    unsafe fn reset_pool(&self, pool: vk::DescriptorPool) -> Result<(), vk::Result>;
+    /// `vkAllocateDescriptorSets` of the one set `info` names.
+    unsafe fn allocate_set(
+        &self,
+        info: &vk::DescriptorSetAllocateInfo<'_>,
+    ) -> Result<vk::DescriptorSet, vk::Result>;
+    /// `vkFreeDescriptorSets` of one set.
+    unsafe fn free_set(
+        &self,
+        pool: vk::DescriptorPool,
+        set: vk::DescriptorSet,
+    ) -> Result<(), vk::Result>;
+}
+
+impl PoolDevice for ash::Device {
+    unsafe fn create_pool(
+        &self,
+        info: &vk::DescriptorPoolCreateInfo<'_>,
+    ) -> Result<vk::DescriptorPool, vk::Result> {
+        unsafe { self.create_descriptor_pool(info, None) }
+    }
+
+    unsafe fn destroy_pool(&self, pool: vk::DescriptorPool) {
+        unsafe { self.destroy_descriptor_pool(pool, None) }
+    }
+
+    unsafe fn reset_pool(&self, pool: vk::DescriptorPool) -> Result<(), vk::Result> {
+        unsafe { self.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty()) }
+    }
+
+    unsafe fn allocate_set(
+        &self,
+        info: &vk::DescriptorSetAllocateInfo<'_>,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        unsafe { self.allocate_descriptor_sets(info) }.map(|sets| sets[0])
+    }
+
+    unsafe fn free_set(
+        &self,
+        pool: vk::DescriptorPool,
+        set: vk::DescriptorSet,
+    ) -> Result<(), vk::Result> {
+        unsafe { self.free_descriptor_sets(pool, core::slice::from_ref(&set)) }
+    }
+}
+
 const POOL_MIN_SETS: u32 = 64;
 const POOL_MAX_SETS: u32 = 512;
 
@@ -74,9 +134,9 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn create_pool(
+    fn create_pool<D: PoolDevice>(
         &mut self,
-        device: &ash::Device,
+        device: &D,
         key: &BucketKey,
         capacity_hint: u32,
     ) -> Result<(usize, &mut Pool), crate::DeviceError> {
@@ -114,9 +174,9 @@ impl DescriptorAllocator {
         }
     }
 
-    pub fn register_layout(
+    pub fn register_layout<D: PoolDevice>(
         &mut self,
-        device: &ash::Device,
+        device: &D,
         layout: &super::BindGroupLayout,
     ) -> Result<(), crate::DeviceError> {
         let key = layout.bucket_key();
@@ -136,7 +196,11 @@ impl DescriptorAllocator {
         Ok(())
     }
 
-    pub fn unregister_layout(&mut self, device: &ash::Device, layout: &super::BindGroupLayout) {
+    pub fn unregister_layout<D: PoolDevice>(
+        &mut self,
+        device: &D,
+        layout: &super::BindGroupLayout,
+    ) {
         let key = layout.bucket_key();
         let bucket = self.buckets.get_mut(&key).unwrap();
 
@@ -150,14 +214,14 @@ impl DescriptorAllocator {
                     pool.available, pool.capacity,
                     "pool is not empty, at least one DescriptorSet has not been freed"
                 );
-                unsafe { device.destroy_descriptor_pool(pool.raw, None) };
+                unsafe { device.destroy_pool(pool.raw) };
             }
         }
     }
 
-    pub unsafe fn alloc(
+    pub unsafe fn alloc<D: PoolDevice>(
         &mut self,
-        device: &ash::Device,
+        device: &D,
         layout: &super::BindGroupLayout,
     ) -> Result<DescriptorSet, crate::DeviceError> {
         let update_after_bind = layout.contains_binding_arrays;
@@ -211,15 +275,15 @@ impl DescriptorAllocator {
             // it. A fragmented pool is reset once its last set is freed.
             //
             // See https://github.com/gfx-rs/wgpu/pull/10264
-            match unsafe { device.allocate_descriptor_sets(&vk_info) } {
-                Ok(sets) => break (sets[0], index),
+            match unsafe { device.allocate_set(&vk_info) } {
+                Ok(set) => break (set, index),
                 Err(vk::Result::ERROR_FRAGMENTED_POOL | vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
                     if created_pool {
                         // A fresh pool failing to allocate even a single set leaves
                         // no pool left to fall back to, so drop it and give up.
                         let pool = bucket.pools.pop().unwrap();
                         bucket.available_sets -= pool.capacity;
-                        unsafe { device.destroy_descriptor_pool(pool.raw, None) };
+                        unsafe { device.destroy_pool(pool.raw) };
                         log::error!(
                             "descriptor set allocation from a fresh pool failed unexpectedly"
                         );
@@ -232,15 +296,10 @@ impl DescriptorAllocator {
                     // pool that has no live sets.
                     let pool = &bucket.pools[index];
                     if pool.available == pool.capacity {
-                        let reset_result = unsafe {
-                            device.reset_descriptor_pool(
-                                pool.raw,
-                                vk::DescriptorPoolResetFlags::empty(),
-                            )
-                        };
+                        let reset_result = unsafe { device.reset_pool(pool.raw) };
                         if reset_result.is_ok() {
-                            match unsafe { device.allocate_descriptor_sets(&vk_info) } {
-                                Ok(sets) => break (sets[0], index),
+                            match unsafe { device.allocate_set(&vk_info) } {
+                                Ok(set) => break (set, index),
                                 Err(
                                     vk::Result::ERROR_FRAGMENTED_POOL
                                     | vk::Result::ERROR_OUT_OF_POOL_MEMORY,
@@ -281,12 +340,11 @@ impl DescriptorAllocator {
         })
     }
 
-    pub unsafe fn free(&mut self, device: &ash::Device, set: DescriptorSet) {
+    pub unsafe fn free<D: PoolDevice>(&mut self, device: &D, set: DescriptorSet) {
         let bucket = self.buckets.get_mut(&set.bucket_key).unwrap();
         let pool = bucket.pools.get_mut(set.pool_index).unwrap();
 
-        let result =
-            unsafe { device.free_descriptor_sets(pool.raw, core::slice::from_ref(&set.raw())) };
+        let result = unsafe { device.free_set(pool.raw, set.raw()) };
         if let Err(err) = result {
             // vkFreeDescriptorSets is documented to return:
             // - VK_ERROR_UNKNOWN
@@ -306,9 +364,7 @@ impl DescriptorAllocator {
             // they do not count towards `available_sets`.
             // On Mali, freeing sets does not make such a pool usable again;
             // resetting it is what does, and that is only safe once no sets are live.
-            let reset_result = unsafe {
-                device.reset_descriptor_pool(pool.raw, vk::DescriptorPoolResetFlags::empty())
-            };
+            let reset_result = unsafe { device.reset_pool(pool.raw) };
             if reset_result.is_ok() {
                 pool.fragmented = false;
                 bucket.available_sets += pool.capacity;
@@ -334,7 +390,7 @@ impl DescriptorAllocator {
             && bucket.available_sets - last_contribution > last_capacity / 4
         {
             let pool = bucket.pools.pop().unwrap();
-            unsafe { device.destroy_descriptor_pool(pool.raw, None) };
+            unsafe { device.destroy_pool(pool.raw) };
             bucket.available_sets -= last_contribution;
         }
     }
@@ -351,8 +407,8 @@ impl Drop for DescriptorAllocator {
     }
 }
 
-fn create_descriptor_pool(
-    device: &ash::Device,
+fn create_descriptor_pool<D: PoolDevice>(
+    device: &D,
     key: &BucketKey,
     capacity_hint: u32,
 ) -> Result<Pool, crate::DeviceError> {
@@ -417,7 +473,7 @@ fn create_descriptor_pool(
         .max_sets(capacity)
         .pool_sizes(&pool_sizes);
 
-    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
+    let raw = unsafe { device.create_pool(&vk_info) }
         .map_err(super::map_host_device_oom_and_fragmentation_err)?;
 
     Ok(Pool {
@@ -426,4 +482,262 @@ fn create_descriptor_pool(
         available: capacity,
         fragmented: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::collections::VecDeque;
+    use ash::vk::Handle as _;
+    use core::cell::{Cell, RefCell};
+
+    /// A pool the way a driver that reuses no slot until a reset keeps one:
+    /// it hands out its `max_sets` slots in order, a freed set's slot stays
+    /// spent, and once every slot was handed out it answers
+    /// `ERROR_FRAGMENTED_POOL` while it holds fewer than `max_sets` live sets
+    /// (the Mali driver of the Galaxy Tab S11 answers this way after a pool
+    /// has served its sets, though the sets all have one shape).
+    struct BumpPool {
+        max_sets: u32,
+        handed_out: u32,
+        live: HashSet<u64>,
+    }
+
+    #[derive(Default)]
+    struct BumpDriver {
+        pools: RefCell<HashMap<u64, BumpPool>>,
+        next_handle: Cell<u64>,
+        /// Every allocation fails with `ERROR_FRAGMENTED_POOL`.
+        refuse_all: bool,
+        fragmented_answers: Cell<u32>,
+        resets: Cell<u32>,
+        created: Cell<u32>,
+        destroyed: Cell<u32>,
+    }
+
+    impl BumpDriver {
+        fn handle(&self) -> u64 {
+            self.next_handle.set(self.next_handle.get() + 1);
+            self.next_handle.get()
+        }
+
+        fn live_sets(&self) -> usize {
+            self.pools.borrow().values().map(|p| p.live.len()).sum()
+        }
+    }
+
+    impl PoolDevice for BumpDriver {
+        unsafe fn create_pool(
+            &self,
+            info: &vk::DescriptorPoolCreateInfo<'_>,
+        ) -> Result<vk::DescriptorPool, vk::Result> {
+            assert!(
+                info.pool_size_count > 0,
+                "a pool states at least one pool size"
+            );
+            let raw = self.handle();
+            self.pools.borrow_mut().insert(
+                raw,
+                BumpPool {
+                    max_sets: info.max_sets,
+                    handed_out: 0,
+                    live: HashSet::default(),
+                },
+            );
+            self.created.set(self.created.get() + 1);
+            Ok(vk::DescriptorPool::from_raw(raw))
+        }
+
+        unsafe fn destroy_pool(&self, pool: vk::DescriptorPool) {
+            let pool = self
+                .pools
+                .borrow_mut()
+                .remove(&pool.as_raw())
+                .expect("a live pool");
+            assert!(pool.live.is_empty(), "a pool is destroyed with live sets");
+            self.destroyed.set(self.destroyed.get() + 1);
+        }
+
+        unsafe fn reset_pool(&self, pool: vk::DescriptorPool) -> Result<(), vk::Result> {
+            let mut pools = self.pools.borrow_mut();
+            let pool = pools.get_mut(&pool.as_raw()).expect("a live pool");
+            assert!(
+                pool.live.is_empty(),
+                "a pool is reset while a set it holds is in use"
+            );
+            pool.handed_out = 0;
+            self.resets.set(self.resets.get() + 1);
+            Ok(())
+        }
+
+        unsafe fn allocate_set(
+            &self,
+            info: &vk::DescriptorSetAllocateInfo<'_>,
+        ) -> Result<vk::DescriptorSet, vk::Result> {
+            let raw = self.handle();
+            let mut pools = self.pools.borrow_mut();
+            let pool = pools
+                .get_mut(&info.descriptor_pool.as_raw())
+                .expect("a live pool");
+            if pool.live.len() as u32 == pool.max_sets {
+                return Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY);
+            }
+            if self.refuse_all || pool.handed_out == pool.max_sets {
+                self.fragmented_answers
+                    .set(self.fragmented_answers.get() + 1);
+                return Err(vk::Result::ERROR_FRAGMENTED_POOL);
+            }
+            pool.handed_out += 1;
+            pool.live.insert(raw);
+            Ok(vk::DescriptorSet::from_raw(raw))
+        }
+
+        unsafe fn free_set(
+            &self,
+            pool: vk::DescriptorPool,
+            set: vk::DescriptorSet,
+        ) -> Result<(), vk::Result> {
+            let mut pools = self.pools.borrow_mut();
+            let pool = pools.get_mut(&pool.as_raw()).expect("a live pool");
+            assert!(
+                pool.live.remove(&set.as_raw()),
+                "a set is freed from a pool that does not hold it"
+            );
+            Ok(())
+        }
+    }
+
+    fn storage_buffer_layout(raw: u64) -> super::super::BindGroupLayout {
+        super::super::BindGroupLayout {
+            raw: vk::DescriptorSetLayout::from_raw(raw),
+            desc_count: DescriptorCounts {
+                storage_buffer: 1,
+                ..Default::default()
+            },
+            entries: Box::new([]),
+            binding_map: Vec::new(),
+            contains_binding_arrays: false,
+        }
+    }
+
+    fn pools_of(allocator: &DescriptorAllocator, layout: &super::super::BindGroupLayout) -> usize {
+        allocator.buckets[&layout.bucket_key()].pools.len()
+    }
+
+    /// Bind groups made and dropped frame after frame, a window of them live
+    /// at once, keep allocating on a driver whose pools reuse no slot until
+    /// a reset, and the pools they take stay bounded.
+    #[test]
+    fn churn_on_pools_that_reuse_no_slot_until_reset_keeps_allocating() {
+        let driver = BumpDriver::default();
+        let mut allocator = DescriptorAllocator::new(0);
+        let layout = storage_buffer_layout(1);
+        allocator.register_layout(&driver, &layout).unwrap();
+
+        const LIVE: usize = 48;
+        let mut live = VecDeque::new();
+        let mut most_pools = 0;
+        for _ in 0..20_000 {
+            let set = unsafe { allocator.alloc(&driver, &layout) }
+                .expect("a set is allocated while sets are freed as fast as they are made");
+            live.push_back(set);
+            if live.len() > LIVE {
+                unsafe { allocator.free(&driver, live.pop_front().unwrap()) };
+            }
+            most_pools = most_pools.max(pools_of(&allocator, &layout));
+        }
+
+        assert!(
+            driver.fragmented_answers.get() > 0,
+            "the driver answered ERROR_FRAGMENTED_POOL"
+        );
+        assert!(
+            driver.resets.get() > 0,
+            "a spent pool is reset once it is empty"
+        );
+        assert!(most_pools <= 4, "the pools stay bounded, held {most_pools}");
+        assert_eq!(driver.live_sets(), LIVE);
+
+        for set in live.drain(..) {
+            unsafe { allocator.free(&driver, set) };
+        }
+        allocator.unregister_layout(&driver, &layout);
+        assert_eq!(
+            driver.created.get(),
+            driver.destroyed.get(),
+            "every pool is destroyed"
+        );
+    }
+
+    /// A set that stays live keeps its pool from being reset, and allocation
+    /// goes on in other pools.
+    #[test]
+    fn a_long_lived_set_does_not_stop_allocation() {
+        let driver = BumpDriver::default();
+        let mut allocator = DescriptorAllocator::new(0);
+        let layout = storage_buffer_layout(1);
+        allocator.register_layout(&driver, &layout).unwrap();
+
+        let pinned = unsafe { allocator.alloc(&driver, &layout) }.unwrap();
+        let mut most_pools = 0;
+        for _ in 0..10_000 {
+            let set = unsafe { allocator.alloc(&driver, &layout) }
+                .expect("a set is allocated beside a long-lived one");
+            unsafe { allocator.free(&driver, set) };
+            most_pools = most_pools.max(pools_of(&allocator, &layout));
+        }
+        assert!(most_pools <= 3, "the pools stay bounded, held {most_pools}");
+
+        unsafe { allocator.free(&driver, pinned) };
+        allocator.unregister_layout(&driver, &layout);
+        assert_eq!(
+            driver.created.get(),
+            driver.destroyed.get(),
+            "every pool is destroyed"
+        );
+        assert_eq!(driver.live_sets(), 0);
+    }
+
+    /// A driver that refuses even a fresh pool's first set answers an error
+    /// to the caller, and the allocator is left able to unregister.
+    #[test]
+    fn a_pool_that_refuses_its_first_set_answers_an_error() {
+        let driver = BumpDriver {
+            refuse_all: true,
+            ..Default::default()
+        };
+        let mut allocator = DescriptorAllocator::new(0);
+        let layout = storage_buffer_layout(1);
+        allocator.register_layout(&driver, &layout).unwrap();
+
+        for _ in 0..2 {
+            let result = unsafe { allocator.alloc(&driver, &layout) };
+            assert!(matches!(result, Err(crate::DeviceError::OutOfMemory)));
+        }
+        assert_eq!(pools_of(&allocator, &layout), 1);
+
+        allocator.unregister_layout(&driver, &layout);
+        assert_eq!(
+            driver.created.get(),
+            driver.destroyed.get(),
+            "every pool is destroyed"
+        );
+    }
+
+    /// A layout with no bindings still makes a pool the driver accepts.
+    #[test]
+    fn an_empty_layout_makes_a_pool_with_a_pool_size() {
+        let driver = BumpDriver::default();
+        let mut allocator = DescriptorAllocator::new(0);
+        let layout = super::super::BindGroupLayout {
+            desc_count: DescriptorCounts::default(),
+            ..storage_buffer_layout(2)
+        };
+        allocator.register_layout(&driver, &layout).unwrap();
+        let set = unsafe { allocator.alloc(&driver, &layout) }.unwrap();
+        unsafe { allocator.free(&driver, set) };
+        allocator.unregister_layout(&driver, &layout);
+        assert_eq!(driver.created.get(), driver.destroyed.get());
+    }
 }
