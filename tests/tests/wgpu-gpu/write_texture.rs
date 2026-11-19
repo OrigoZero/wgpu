@@ -11,6 +11,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         WRITE_TEXTURE_VIA_STAGING_BUFFER,
         WRITE_TEXTURES_EVERY_MIP_LEVEL,
         WRITE_TEXTURES_INVALID_WRITE_WRITES_NONE,
+        WRITE_TEXTURES_A_LATER_WRITE_LANDS_LAST,
     ]);
 }
 
@@ -514,4 +515,51 @@ static WRITE_TEXTURES_INVALID_WRITE_WRITES_NONE: GpuTestConfiguration =
 
         let level0 = read_level(&ctx, &texture, 0, 0).await;
         assert!(level0.iter().all(|&byte| byte == 0), "the valid write ahead of the invalid one is not made");
+    });
+
+/// Writes of one batch into a level an earlier write of the batch wrote land
+/// after it, whether the two are next to each other or another texture's
+/// write lies between them: the level holds what the last write wrote.
+#[gpu_test]
+static WRITE_TEXTURES_A_LATER_WRITE_LANDS_LAST: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let texture = mip_chain_texture(&ctx.device);
+        let other = mip_chain_texture(&ctx.device);
+        let fills: Vec<Vec<u8>> = [10u8, 20, 30, 40, 50].iter().map(|&v| vec![v; 64 * 16 * 4]).collect();
+        fn write<'a>(texture: &'a Texture, layer: u32, data: &'a [u8]) -> TextureWrite<'a> {
+            TextureWrite {
+                texture: TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: Origin3d { x: 0, y: 0, z: layer },
+                    aspect: TextureAspect::All,
+                },
+                data,
+                data_layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(64 * 4),
+                    rows_per_image: Some(16),
+                },
+                size: Extent3d {
+                    width: 64,
+                    height: 16,
+                    depth_or_array_layers: 1,
+                },
+            }
+        }
+        let writes = [
+            // Layer 0 twice in a row.
+            write(&texture, 0, &fills[0]),
+            write(&texture, 0, &fills[1]),
+            // Layer 1, then the other texture, then layer 1 again.
+            write(&texture, 1, &fills[2]),
+            write(&other, 0, &fills[3]),
+            write(&texture, 1, &fills[4]),
+        ];
+        ctx.queue.write_textures(&writes);
+        ctx.queue.submit(None);
+
+        assert!(read_level(&ctx, &texture, 0, 0).await.iter().all(|&byte| byte == 20), "layer 0 holds its second write");
+        assert!(read_level(&ctx, &texture, 1, 0).await.iter().all(|&byte| byte == 50), "layer 1 holds its last write");
+        assert!(read_level(&ctx, &other, 0, 0).await.iter().all(|&byte| byte == 40), "the other texture holds its write");
     });
