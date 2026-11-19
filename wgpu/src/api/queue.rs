@@ -265,8 +265,10 @@ impl Queue {
     /// many small regions, at once. A backend that records writes on the CPU
     /// takes the queue's pending writes once for the batch and makes the
     /// staged data ready for copying once per staging buffer, where one call
-    /// per write repeats both. Every write is validated before any is made,
-    /// and an invalid one is reported with none of the batch written.
+    /// per write repeats both; it validates every write before it makes any,
+    /// and reports an invalid one with none of the batch written. The browser's
+    /// WebGPU backend hands each write to the browser as a `writeTexture` of
+    /// its own, which validates and makes each write alone.
     pub fn write_textures(&self, writes: &[TextureWrite<'_>]) {
         self.inner.write_textures(writes);
     }
