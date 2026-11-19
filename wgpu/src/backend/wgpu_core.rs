@@ -2138,6 +2138,25 @@ impl dispatch::QueueInterface for CoreQueue {
         }
     }
 
+    fn write_textures(&self, writes: &[crate::TextureWrite<'_>]) {
+        let writes = writes
+            .iter()
+            .map(|write| wgc::device::queue::TextureWrite {
+                destination: map_texture_copy_view(write.texture),
+                data: write.data,
+                data_layout: write.data_layout,
+                size: write.size,
+            })
+            .collect::<Vec<_>>();
+        match self.context.0.queue_write_textures(self.id, &writes) {
+            Ok(()) => (),
+            Err(err) => {
+                self.context
+                    .handle_error_nolabel(&self.error_sink, err, "Queue::write_textures")
+            }
+        }
+    }
+
     // This method needs to exist if either webgpu or webgl is enabled,
     // but we only actually have an implementation if webgl is enabled.
     #[cfg(web)]

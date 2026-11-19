@@ -256,6 +256,13 @@ pub trait QueueInterface: CommonTraits {
         data_layout: crate::TexelCopyBufferLayout,
         size: crate::Extent3d,
     );
+    /// Each of `writes`, in order, as [`QueueInterface::write_texture`] makes
+    /// one.
+    fn write_textures(&self, writes: &[crate::TextureWrite<'_>]) {
+        for write in writes {
+            self.write_texture(write.texture, write.data, write.data_layout, write.size);
+        }
+    }
     #[cfg(web)]
     fn copy_external_image_to_texture(
         &self,

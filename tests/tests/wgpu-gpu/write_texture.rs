@@ -1,7 +1,7 @@
 //! Tests for texture copy
 
 use wgpu::*;
-use wgpu_test::{gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
+use wgpu_test::{fail, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend([
@@ -9,6 +9,8 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         WRITE_TEXTURE_SUBSET_3D,
         WRITE_TEXTURE_NO_OOB,
         WRITE_TEXTURE_VIA_STAGING_BUFFER,
+        WRITE_TEXTURES_EVERY_MIP_LEVEL,
+        WRITE_TEXTURES_INVALID_WRITE_WRITES_NONE,
     ]);
 }
 
@@ -358,4 +360,158 @@ static WRITE_TEXTURE_VIA_STAGING_BUFFER: GpuTestConfiguration = GpuTestConfigura
                 );
             }
         }
+    });
+
+/// The texture both `write_textures` tests write: 64x16 RGBA8, its whole
+/// chain of 7 levels, two layers.
+fn mip_chain_texture(device: &Device) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some("write_textures chain"),
+        size: Extent3d {
+            width: 64,
+            height: 16,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 7,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// Every texel of mip `level` of layer `layer` of `texture`, read back.
+async fn read_level(ctx: &wgpu_test::TestingContext, texture: &Texture, layer: u32, level: u32) -> Vec<u8> {
+    let (width, height) = ((64u32 >> level).max(1), (16u32 >> level).max(1));
+    let bytes_per_row = COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = ctx.device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: u64::from(bytes_per_row * height),
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&CommandEncoderDescriptor { label: None });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: Origin3d { x: 0, y: 0, z: layer },
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    ctx.queue.submit(Some(encoder.finish()));
+    let slice = buffer.slice(..);
+    slice.map_async(MapMode::Read, |_| ());
+    ctx.async_poll(PollType::wait_indefinitely()).await.unwrap();
+    let mapped = slice.get_mapped_range().unwrap();
+    let texels = (0..height as usize)
+        .flat_map(|row| {
+            let start = row * bytes_per_row as usize;
+            mapped[start..start + width as usize * 4].to_vec()
+        })
+        .collect();
+    drop(mapped);
+    buffer.unmap();
+    texels
+}
+
+/// One `write_textures` call writes a whole mip chain of one layer, each
+/// level from its own bytes (rows of a level narrower than the copy
+/// alignment included), and leaves the other layer as it was.
+#[gpu_test]
+static WRITE_TEXTURES_EVERY_MIP_LEVEL: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let texture = mip_chain_texture(&ctx.device);
+        let levels: Vec<Vec<u8>> = (0..7u32)
+            .map(|level| {
+                let texels = ((64u32 >> level).max(1) * (16u32 >> level).max(1)) as usize;
+                (0..texels * 4).map(|i| (i as u8).wrapping_mul(7).wrapping_add(level as u8 * 31)).collect()
+            })
+            .collect();
+        let writes: Vec<TextureWrite<'_>> = (0u32..)
+            .zip(&levels)
+            .map(|(level, data)| {
+                let (width, height) = ((64u32 >> level).max(1), (16u32 >> level).max(1));
+                TextureWrite {
+                    texture: TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: level,
+                        origin: Origin3d { x: 0, y: 0, z: 1 },
+                        aspect: TextureAspect::All,
+                    },
+                    data,
+                    data_layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    size: Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                }
+            })
+            .collect();
+        ctx.queue.write_textures(&writes);
+        ctx.queue.submit(None);
+
+        for (level, expected) in (0u32..).zip(&levels) {
+            assert_eq!(&read_level(&ctx, &texture, 1, level).await, expected, "level {level} of the written layer");
+            let untouched = read_level(&ctx, &texture, 0, level).await;
+            assert!(untouched.iter().all(|&byte| byte == 0), "level {level} of the other layer stays zero");
+        }
+    });
+
+/// A batch holding an invalid write reports it and writes none of the batch,
+/// the valid writes before it included.
+#[gpu_test]
+static WRITE_TEXTURES_INVALID_WRITE_WRITES_NONE: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let texture = mip_chain_texture(&ctx.device);
+        let data = vec![200u8; 64 * 16 * 4];
+        let write = |level: u32, width: u32, height: u32| TextureWrite {
+            texture: TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            data: &data,
+            data_layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        };
+        // Level 1 is 32x8: a 64-wide write overruns it.
+        let writes = [write(0, 64, 16), write(1, 64, 8)];
+        fail(
+            &ctx.device,
+            || ctx.queue.write_textures(&writes),
+            Some("overrunning the bounds of the destination texture"),
+        );
+        ctx.queue.submit(None);
+
+        let level0 = read_level(&ctx, &texture, 0, 0).await;
+        assert!(level0.iter().all(|&byte| byte == 0), "the valid write ahead of the invalid one is not made");
     });
