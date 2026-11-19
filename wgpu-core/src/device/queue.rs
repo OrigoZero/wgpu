@@ -1145,8 +1145,9 @@ impl Queue {
     /// every destination's uninitialized layers cleared, the texels of every
     /// write staged in one staging region, one barrier making that region
     /// ready to copy from, the destinations made ready to copy into, and one
-    /// copy per run of writes into the same texture that touch no
-    /// subresource twice.
+    /// copy per run of writes into the same texture. A write into a
+    /// subresource an earlier write of the batch copied into starts a run of
+    /// its own behind a barrier, so it lands after that copy.
     fn record_texture_writes(
         &self,
         writes: &[ValidatedTextureWrite<'_>],
@@ -1313,23 +1314,48 @@ impl Queue {
                 }]);
             }
 
-            // One copy per run of writes into one texture, a run ending where
-            // a write would copy into a subresource the run already copies into.
+            // One copy per run of writes into one texture. A write into a
+            // subresource an earlier write of the batch copied into (in this
+            // run or an earlier one) ends the run, and a barrier orders its
+            // copy after the earlier one.
             let mut regions = SmallVec::<[hal::BufferTextureCopy; 16]>::new();
             let mut run_texture: Option<&dyn hal::DynTexture> = None;
+            // Every subresource the batch has copied into so far: its texture,
+            // mip level and array layer.
+            let mut written = SmallVec::<[(&dyn hal::DynTexture, u32, u32); 16]>::new();
             for ((write, place), raw) in writes.iter().zip(&placed).zip(&raws) {
                 let layers = write.dst_base.array_layer..write.dst_base.array_layer + write.array_layer_count;
                 let same_texture = run_texture.is_some_and(|texture| core::ptr::addr_eq(texture, *raw));
-                let overlaps = regions.iter().any(|region| {
-                    region.texture_base.mip_level == write.dst_base.mip_level
-                        && layers.contains(&region.texture_base.array_layer)
+                let rewrites = written.iter().any(|&(texture, mip_level, array_layer)| {
+                    core::ptr::addr_eq(texture, *raw)
+                        && mip_level == write.dst_base.mip_level
+                        && layers.contains(&array_layer)
                 });
-                if let Some(texture) = run_texture.filter(|_| !same_texture || overlaps) {
+                if let Some(texture) = run_texture.filter(|_| !same_texture || rewrites) {
                     unsafe { encoder.copy_buffer_to_texture(source, texture, &regions) };
                     regions.clear();
                 }
+                if rewrites {
+                    unsafe {
+                        encoder.transition_textures(&[hal::TextureBarrier {
+                            texture: *raw,
+                            range: wgt::ImageSubresourceRange {
+                                aspect: wgt::TextureAspect::All,
+                                base_mip_level: write.dst_base.mip_level,
+                                mip_level_count: Some(1),
+                                base_array_layer: layers.start,
+                                array_layer_count: Some(write.array_layer_count),
+                            },
+                            usage: hal::StateTransition {
+                                from: wgt::TextureUses::COPY_DST,
+                                to: wgt::TextureUses::COPY_DST,
+                            },
+                        }]);
+                    }
+                }
                 run_texture = Some(*raw);
                 for array_layer_offset in 0..write.array_layer_count {
+                    written.push((*raw, write.dst_base.mip_level, write.dst_base.array_layer + array_layer_offset));
                     let mut texture_base = write.dst_base.clone();
                     texture_base.array_layer += array_layer_offset;
                     regions.push(hal::BufferTextureCopy {
