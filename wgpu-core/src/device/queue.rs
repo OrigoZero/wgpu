@@ -339,6 +339,29 @@ pub enum TempResource {
     DestroyedQuerySet(DestroyedQuerySet),
 }
 
+/// One write of [`Queue::write_textures`]: what [`Queue::write_texture`]
+/// takes, as one value, naming its texture by `T`.
+#[derive(Clone, Debug)]
+pub struct TextureWrite<'a, T = Arc<Texture>> {
+    pub destination: wgt::TexelCopyTextureInfo<T>,
+    pub data: &'a [u8],
+    pub data_layout: wgt::TexelCopyBufferLayout,
+    pub size: wgt::Extent3d,
+}
+
+/// A texture write that passed validation, with what recording it needs.
+struct ValidatedTextureWrite<'a> {
+    dst: Arc<Texture>,
+    destination: wgt::TexelCopyTextureInfo<()>,
+    data: &'a [u8],
+    data_layout: wgt::TexelCopyBufferLayout,
+    size: wgt::Extent3d,
+    hal_copy_size: hal::CopyExtent,
+    array_layer_count: u32,
+    selector: wgt::TextureSelector,
+    dst_base: hal::TextureCopyBase,
+}
+
 /// A series of raw [`CommandBuffer`]s that have been submitted to a
 /// queue, and the [`wgpu_hal::CommandEncoder`] that built them.
 ///
@@ -995,6 +1018,56 @@ impl Queue {
 
         self.device.check_is_valid()?;
 
+        let Some(write) = self.validate_texture_write(destination, data, data_layout, size)? else {
+            return Ok(());
+        };
+        let snatch_guard = self.device.snatchable_lock.read();
+        let mut pending_writes = self.pending_writes.lock();
+        self.record_texture_writes(core::slice::from_ref(&write), &snatch_guard, &mut pending_writes)
+    }
+
+    /// Schedule each of `writes` as [`Queue::write_texture`] schedules one,
+    /// under one acquisition of the queue's pending writes, staged in one
+    /// staging region and copied with one copy command per run of writes into
+    /// one texture: the form for writing every mip level of a texture, or
+    /// many small regions, at once.
+    /// The writes land in order. Every write is validated before any is
+    /// recorded, and the first invalid one is reported with none of the batch
+    /// written.
+    pub fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<(), QueueWriteError> {
+        profiling::scope!("Queue::write_textures");
+        api_log!("Queue::write_textures");
+
+        self.device.check_is_valid()?;
+
+        let mut validated = Vec::with_capacity(writes.len());
+        for write in writes {
+            if let Some(write) = self.validate_texture_write(
+                write.destination.clone(),
+                write.data,
+                &write.data_layout,
+                &write.size,
+            )? {
+                validated.push(write);
+            }
+        }
+        if validated.is_empty() {
+            return Ok(());
+        }
+        let snatch_guard = self.device.snatchable_lock.read();
+        let mut pending_writes = self.pending_writes.lock();
+        self.record_texture_writes(&validated, &snatch_guard, &mut pending_writes)
+    }
+
+    /// Check a texture write the way the spec orders it, and answer what
+    /// recording it needs, or `None` for a write of no texels.
+    fn validate_texture_write<'a>(
+        &self,
+        destination: wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        data: &'a [u8],
+        data_layout: &wgt::TexelCopyBufferLayout,
+        size: &wgt::Extent3d,
+    ) -> Result<Option<ValidatedTextureWrite<'a>>, QueueWriteError> {
         let dst = destination.texture;
         let destination = wgt::TexelCopyTextureInfo {
             texture: (),
@@ -1027,7 +1100,7 @@ impl Queue {
 
         // Note: `_source_bytes_per_array_layer` is ignored since we
         // have a staging copy, and it can have a different value.
-        let (required_bytes_in_copy, _source_bytes_per_array_layer, _) =
+        let (_required_bytes_in_copy, _source_bytes_per_array_layer, _) =
             validate_linear_texture_data(
                 data_layout,
                 dst.desc.format,
@@ -1043,182 +1116,246 @@ impl Queue {
                 .map_err(TransferError::from)?;
         }
 
-        let snatch_guard = self.device.snatchable_lock.read();
-
-        let dst_raw = dst.try_inner(&snatch_guard)?.raw();
+        {
+            let snatch_guard = self.device.snatchable_lock.read();
+            dst.try_inner(&snatch_guard)?;
+        }
 
         // This must happen after parameter validation (so that errors are reported
         // as required by the spec), but before any side effects.
         if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
             log::trace!("Ignoring write_texture of size 0");
-            return Ok(());
+            return Ok(None);
         }
 
-        self.device.counters.texture_writes.add(1);
+        Ok(Some(ValidatedTextureWrite {
+            dst,
+            destination,
+            data,
+            data_layout: *data_layout,
+            size: *size,
+            hal_copy_size,
+            array_layer_count,
+            selector,
+            dst_base,
+        }))
+    }
 
-        let mut pending_writes = self.pending_writes.lock();
+    /// Record validated texture writes into the pending writes, in order:
+    /// every destination's uninitialized layers cleared, the texels of every
+    /// write staged in one staging region, one barrier making that region
+    /// ready to copy from, the destinations made ready to copy into, and one
+    /// copy per run of writes into the same texture that touch no
+    /// subresource twice.
+    fn record_texture_writes(
+        &self,
+        writes: &[ValidatedTextureWrite<'_>],
+        snatch_guard: &SnatchGuard,
+        pending_writes: &mut PendingWrites,
+    ) -> Result<(), QueueWriteError> {
+        let mut raws = SmallVec::<[&dyn hal::DynTexture; 16]>::with_capacity(writes.len());
+        for write in writes {
+            raws.push(write.dst.try_inner(snatch_guard)?.raw());
+        }
+
         let encoder = pending_writes.activate();
+        for write in writes {
+            self.device.counters.texture_writes.add(1);
+            let (dst, destination, size) = (&write.dst, &write.destination, &write.size);
 
-        // If the copy does not fully cover the layers, we need to initialize to
-        // zero *first* as we don't keep track of partial texture layer inits.
-        //
-        // Strictly speaking we only need to clear the areas of a layer
-        // untouched, but this would get increasingly messy.
-        let init_layer_range = if dst.desc.dimension == wgt::TextureDimension::D3 {
-            // volume textures don't have a layer range as array volumes aren't supported
-            0..1
-        } else {
-            destination.origin.z..destination.origin.z + size.depth_or_array_layers
-        };
-        let mut dst_initialization_status = dst.initialization_status.write();
-        if dst_initialization_status.mips[destination.mip_level as usize]
-            .check(init_layer_range.clone())
-            .is_some()
-        {
-            if has_copy_partial_init_tracker_coverage(size, &destination, &dst.desc) {
-                for layer_range in dst_initialization_status.mips[destination.mip_level as usize]
-                    .drain(init_layer_range)
-                    .collect::<Vec<core::ops::Range<u32>>>()
-                {
-                    let mut trackers = self.device.trackers.lock();
-                    crate::command::clear_texture(
-                        &dst,
-                        TextureInitRange {
-                            mip_range: destination.mip_level..(destination.mip_level + 1),
-                            layer_range,
-                        },
-                        encoder,
-                        &mut trackers.textures,
-                        &self.device.alignments,
-                        self.device.zero_buffer.as_ref(),
-                        &snatch_guard,
-                        self.device.instance_flags,
-                    )
-                    .map_err(QueueWriteError::from)?;
-                }
+            // If the copy does not fully cover the layers, we need to initialize to
+            // zero *first* as we don't keep track of partial texture layer inits.
+            //
+            // Strictly speaking we only need to clear the areas of a layer
+            // untouched, but this would get increasingly messy.
+            let init_layer_range = if dst.desc.dimension == wgt::TextureDimension::D3 {
+                // volume textures don't have a layer range as array volumes aren't supported
+                0..1
             } else {
-                dst_initialization_status.mips[destination.mip_level as usize]
-                    .drain(init_layer_range);
+                destination.origin.z..destination.origin.z + size.depth_or_array_layers
+            };
+            let mut dst_initialization_status = dst.initialization_status.write();
+            if dst_initialization_status.mips[destination.mip_level as usize]
+                .check(init_layer_range.clone())
+                .is_some()
+            {
+                if has_copy_partial_init_tracker_coverage(size, destination, &dst.desc) {
+                    for layer_range in dst_initialization_status.mips
+                        [destination.mip_level as usize]
+                        .drain(init_layer_range)
+                        .collect::<Vec<core::ops::Range<u32>>>()
+                    {
+                        let mut trackers = self.device.trackers.lock();
+                        crate::command::clear_texture(
+                            dst,
+                            TextureInitRange {
+                                mip_range: destination.mip_level..(destination.mip_level + 1),
+                                layer_range,
+                            },
+                            encoder,
+                            &mut trackers.textures,
+                            &self.device.alignments,
+                            self.device.zero_buffer.as_ref(),
+                            snatch_guard,
+                            self.device.instance_flags,
+                        )
+                        .map_err(QueueWriteError::from)?;
+                    }
+                } else {
+                    dst_initialization_status.mips[destination.mip_level as usize]
+                        .drain(init_layer_range);
+                }
             }
         }
 
-        let (block_width, block_height) = dst.desc.format.block_dimensions();
-        let width_in_blocks = size.width / block_width;
-        let height_in_blocks = size.height / block_height;
-
-        let block_size = dst
-            .desc
-            .format
-            .block_copy_size(Some(destination.aspect))
-            .unwrap();
-        let bytes_in_last_row = width_in_blocks * block_size;
-
-        let bytes_per_row = data_layout.bytes_per_row.unwrap_or(bytes_in_last_row);
-        let rows_per_image = data_layout.rows_per_image.unwrap_or(height_in_blocks);
-
-        let bytes_per_row_alignment = get_lowest_common_denom(
-            self.device.alignments.buffer_copy_pitch.get() as u32,
-            block_size,
-        );
-        assert!(u32::MAX - bytes_in_last_row >= bytes_per_row_alignment);
-        let stage_bytes_per_row = wgt::math::align_to(bytes_in_last_row, bytes_per_row_alignment);
-
-        // The staged copy starts where the device copies a texture from a
-        // buffer at its fastest, on a whole texel block.
-        let stage_alignment = get_lowest_common_denom(
-            get_lowest_common_denom(
-                self.device.alignments.buffer_copy_offset.get() as u32,
+        // Where each write's texels sit in the staging region, in the layout
+        // the device copies a texture from a buffer at its fastest: rows at
+        // the device's pitch, each write on a whole texel block.
+        struct Placed {
+            offset: wgt::BufferAddress,
+            stage_bytes_per_row: u32,
+            rows_per_image: u32,
+            source_bytes_per_row: u32,
+            bytes_in_last_row: u32,
+            block_rows: u64,
+        }
+        let mut placed = SmallVec::<[Placed; 16]>::with_capacity(writes.len());
+        let mut stage_size: wgt::BufferAddress = 0;
+        let mut stage_alignment: wgt::BufferAddress = wgt::COPY_BUFFER_ALIGNMENT;
+        for write in writes {
+            let format = write.dst.desc.format;
+            let (block_width, block_height) = format.block_dimensions();
+            let width_in_blocks = write.size.width / block_width;
+            let height_in_blocks = write.size.height / block_height;
+            let block_size = format.block_copy_size(Some(write.destination.aspect)).unwrap();
+            let bytes_in_last_row = width_in_blocks * block_size;
+            let source_bytes_per_row = write.data_layout.bytes_per_row.unwrap_or(bytes_in_last_row);
+            let rows_per_image = write.data_layout.rows_per_image.unwrap_or(height_in_blocks);
+            let bytes_per_row_alignment = get_lowest_common_denom(
+                self.device.alignments.buffer_copy_pitch.get() as u32,
                 block_size,
-            ),
-            wgt::COPY_BUFFER_ALIGNMENT as u32,
-        ) as wgt::BufferAddress;
+            );
+            assert!(u32::MAX - bytes_in_last_row >= bytes_per_row_alignment);
+            let stage_bytes_per_row = wgt::math::align_to(bytes_in_last_row, bytes_per_row_alignment);
+            let alignment = wgt::BufferAddress::from(get_lowest_common_denom(
+                get_lowest_common_denom(self.device.alignments.buffer_copy_offset.get() as u32, block_size),
+                wgt::COPY_BUFFER_ALIGNMENT as u32,
+            ));
+            stage_alignment = stage_alignment.max(alignment);
+            let offset = wgt::math::align_to(stage_size, alignment);
+            let block_rows = u64::from(write.size.depth_or_array_layers - 1) * u64::from(rows_per_image)
+                + u64::from(height_in_blocks);
+            stage_size = offset + u64::from(stage_bytes_per_row) * block_rows;
+            placed.push(Placed {
+                offset,
+                stage_bytes_per_row,
+                rows_per_image,
+                source_bytes_per_row,
+                bytes_in_last_row,
+                block_rows,
+            });
+        }
 
         // Platform validation requires that the staging memory always be
         // kept until the submission, even if an error occurs. All paths from
         // here must call `pending_writes.consume_staged`.
-        let staged = if stage_bytes_per_row == bytes_per_row {
-            // Fast path if the data is already being aligned optimally.
-            let stage_size = wgt::BufferSize::new(required_bytes_in_copy).unwrap();
-            pending_writes.stage(&self.device, stage_size, stage_alignment, |staging| {
-                profiling::scope!("copy aligned");
-                let start = data_layout.offset as usize;
-                staging.copy_from_slice(&data[start..start + staging.len()]);
-            })?
-        } else {
-            // Copy row by row into the optimal alignment.
-            let block_rows_in_copy = u64::from(size.depth_or_array_layers - 1)
-                * u64::from(rows_per_image)
-                + u64::from(height_in_blocks);
-            // The copy size was validated against the source buffer, however,
-            // `stage_bytes_per_row` can differ, so let's be paranoid.
-            let stage_size = u64::from(stage_bytes_per_row)
-                .checked_mul(block_rows_in_copy)
-                .and_then(wgt::BufferSize::new)
-                .unwrap();
-            pending_writes.stage(&self.device, stage_size, stage_alignment, |staging| {
-                profiling::scope!("copy chunked");
-                for layer in 0..u64::from(size.depth_or_array_layers) {
-                    let rows_offset = layer * u64::from(rows_per_image);
-                    for row in rows_offset..rows_offset + u64::from(height_in_blocks) {
-                        let src_offset =
-                            (data_layout.offset + row * u64::from(bytes_per_row)) as usize;
-                        let dst_offset = (row * u64::from(stage_bytes_per_row)) as usize;
-                        let row_size = bytes_in_last_row as usize;
-                        staging[dst_offset..dst_offset + row_size]
-                            .copy_from_slice(&data[src_offset..src_offset + row_size]);
+        let staged = pending_writes.stage(
+            &self.device,
+            wgt::BufferSize::new(stage_size).unwrap(),
+            stage_alignment,
+            |staging| {
+                profiling::scope!("copy texels");
+                for (write, place) in writes.iter().zip(&placed) {
+                    let start = write.data_layout.offset as usize;
+                    let row_size = place.bytes_in_last_row as usize;
+                    let rows = place.block_rows as usize;
+                    let at = place.offset as usize;
+                    if place.stage_bytes_per_row == place.source_bytes_per_row {
+                        let len = place.stage_bytes_per_row as usize * (rows - 1) + row_size;
+                        staging[at..at + len].copy_from_slice(&write.data[start..start + len]);
+                    } else {
+                        for row in 0..rows {
+                            let src = start + row * place.source_bytes_per_row as usize;
+                            let dst = at + row * place.stage_bytes_per_row as usize;
+                            staging[dst..dst + row_size].copy_from_slice(&write.data[src..src + row_size]);
+                        }
                     }
                 }
-            })?
-        };
+            },
+        )?;
 
         {
             let (encoder, source, stage_offset) = pending_writes.activate_staged(&staged);
 
-            let regions = (0..array_layer_count)
-                .map(|array_layer_offset| {
-                    let mut texture_base = dst_base.clone();
-                    texture_base.array_layer += array_layer_offset;
-                    hal::BufferTextureCopy {
-                        buffer_layout: wgt::TexelCopyBufferLayout {
-                            offset: stage_offset
-                                + array_layer_offset as u64
-                                    * rows_per_image as u64
-                                    * stage_bytes_per_row as u64,
-                            bytes_per_row: Some(stage_bytes_per_row),
-                            rows_per_image: Some(rows_per_image),
-                        },
-                        texture_base,
-                        size: hal_copy_size,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let buffer_barrier = hal::BufferBarrier {
-                buffer: source,
-                usage: hal::StateTransition {
-                    from: wgt::BufferUses::MAP_WRITE,
-                    to: wgt::BufferUses::COPY_SRC,
-                },
-            };
-
-            let mut trackers = self.device.trackers.lock();
-            let transition =
-                trackers
-                    .textures
-                    .set_single(&dst, selector, wgt::TextureUses::COPY_DST);
-            let texture_barriers = transition
-                .map(|pending| pending.into_hal(dst_raw))
-                .collect::<Vec<_>>();
+            let mut texture_barriers = Vec::new();
+            {
+                let mut trackers = self.device.trackers.lock();
+                for (write, raw) in writes.iter().zip(&raws) {
+                    texture_barriers.extend(
+                        trackers
+                            .textures
+                            .set_single(&write.dst, write.selector.clone(), wgt::TextureUses::COPY_DST)
+                            .map(|pending| pending.into_hal(*raw)),
+                    );
+                }
+            }
 
             unsafe {
-                encoder.transition_textures(&texture_barriers);
-                encoder.transition_buffers(&[buffer_barrier]);
-                encoder.copy_buffer_to_texture(source, dst_raw, &regions);
+                if !texture_barriers.is_empty() {
+                    encoder.transition_textures(&texture_barriers);
+                }
+                encoder.transition_buffers(&[hal::BufferBarrier {
+                    buffer: source,
+                    usage: hal::StateTransition {
+                        from: wgt::BufferUses::MAP_WRITE,
+                        to: wgt::BufferUses::COPY_SRC,
+                    },
+                }]);
+            }
+
+            // One copy per run of writes into one texture, a run ending where
+            // a write would copy into a subresource the run already copies into.
+            let mut regions = SmallVec::<[hal::BufferTextureCopy; 16]>::new();
+            let mut run_texture: Option<&dyn hal::DynTexture> = None;
+            for ((write, place), raw) in writes.iter().zip(&placed).zip(&raws) {
+                let layers = write.dst_base.array_layer..write.dst_base.array_layer + write.array_layer_count;
+                let same_texture = run_texture.is_some_and(|texture| core::ptr::addr_eq(texture, *raw));
+                let overlaps = regions.iter().any(|region| {
+                    region.texture_base.mip_level == write.dst_base.mip_level
+                        && layers.contains(&region.texture_base.array_layer)
+                });
+                if let Some(texture) = run_texture.filter(|_| !same_texture || overlaps) {
+                    unsafe { encoder.copy_buffer_to_texture(source, texture, &regions) };
+                    regions.clear();
+                }
+                run_texture = Some(*raw);
+                for array_layer_offset in 0..write.array_layer_count {
+                    let mut texture_base = write.dst_base.clone();
+                    texture_base.array_layer += array_layer_offset;
+                    regions.push(hal::BufferTextureCopy {
+                        buffer_layout: wgt::TexelCopyBufferLayout {
+                            offset: stage_offset
+                                + place.offset
+                                + u64::from(array_layer_offset)
+                                    * u64::from(place.rows_per_image)
+                                    * u64::from(place.stage_bytes_per_row),
+                            bytes_per_row: Some(place.stage_bytes_per_row),
+                            rows_per_image: Some(place.rows_per_image),
+                        },
+                        texture_base,
+                        size: write.hal_copy_size,
+                    });
+                }
+            }
+            if let Some(texture) = run_texture {
+                unsafe { encoder.copy_buffer_to_texture(source, texture, &regions) };
             }
         }
 
         pending_writes.consume_staged(staged);
-        pending_writes.insert_texture(&dst);
+        for write in writes {
+            pending_writes.insert_texture(&write.dst);
+        }
 
         Ok(())
     }
@@ -2128,6 +2265,45 @@ impl Global {
         }
 
         queue.write_texture(destination, data, data_layout, size)
+    }
+
+    /// [`Queue::write_textures`] on the queue `queue_id`.
+    pub fn queue_write_textures(
+        &self,
+        queue_id: QueueId,
+        writes: &[TextureWrite<'_, id::TextureId>],
+    ) -> Result<(), QueueWriteError> {
+        let queue = self.hub.queues.get(queue_id);
+        let writes = writes
+            .iter()
+            .map(|write| TextureWrite {
+                destination: wgt::TexelCopyTextureInfo {
+                    texture: self.hub.textures.get(write.destination.texture),
+                    mip_level: write.destination.mip_level,
+                    origin: write.destination.origin,
+                    aspect: write.destination.aspect,
+                },
+                data: write.data,
+                data_layout: write.data_layout,
+                size: write.size,
+            })
+            .collect::<Vec<_>>();
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *queue.device.trace.lock() {
+            use crate::device::trace::DataKind;
+            for write in &writes {
+                let data = trace.make_binary(DataKind::Bin, write.data);
+                trace.add(Action::WriteTexture {
+                    to: write.destination.to_trace(),
+                    data,
+                    layout: write.data_layout,
+                    size: write.size,
+                });
+            }
+        }
+
+        queue.write_textures(&writes)
     }
 
     #[cfg(webgl)]

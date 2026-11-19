@@ -260,6 +260,17 @@ impl Queue {
         self.inner.write_texture(texture, data, data_layout, size);
     }
 
+    /// Schedule each of `writes` as [`Queue::write_texture`] would, in order,
+    /// in one call: the form for writing every mip level of a texture, or
+    /// many small regions, at once. A backend that records writes on the CPU
+    /// takes the queue's pending writes once for the batch and makes the
+    /// staged data ready for copying once per staging buffer, where one call
+    /// per write repeats both. Every write is validated before any is made,
+    /// and an invalid one is reported with none of the batch written.
+    pub fn write_textures(&self, writes: &[TextureWrite<'_>]) {
+        self.inner.write_textures(writes);
+    }
+
     /// Schedule a copy of data from `image` into `texture`.
     #[cfg(web)]
     pub fn copy_external_image_to_texture(
@@ -391,4 +402,18 @@ impl Queue {
             inner: dispatch,
         }
     }
+}
+
+/// One write of [`Queue::write_textures`]: what [`Queue::write_texture`]
+/// takes, as one value.
+#[derive(Clone, Debug)]
+pub struct TextureWrite<'a> {
+    /// The texture, mip level, origin and aspect the data is written into.
+    pub texture: TexelCopyTextureInfo<'a>,
+    /// The texels.
+    pub data: &'a [u8],
+    /// How the texels are laid out in `data`.
+    pub data_layout: TexelCopyBufferLayout,
+    /// The extent written.
+    pub size: Extent3d,
 }
