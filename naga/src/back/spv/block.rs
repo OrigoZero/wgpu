@@ -2198,6 +2198,7 @@ impl BlockContext<'_> {
         };
 
         self.cached[expr_handle] = id;
+        self.spill_at_definition(expr_handle, block);
         Ok(())
     }
 
@@ -2915,6 +2916,44 @@ impl BlockContext<'_> {
         }
     }
 
+    /// Find the expressions [`Function::spilled_at_definition`] holds: the
+    /// array and matrix values an [`Access`] subscripts with an index computed
+    /// at runtime.
+    ///
+    /// [`Access`]: crate::Expression::Access
+    pub(super) fn mark_spilled_at_definition(&mut self) {
+        for (_, expr) in self.ir_function.expressions.iter() {
+            let crate::Expression::Access { base, index } = *expr else {
+                continue;
+            };
+            let base_ty_inner = self.fun_info[base].ty.inner_with(&self.ir_module.types);
+            if !matches!(
+                *base_ty_inner,
+                crate::TypeInner::Array { .. } | crate::TypeInner::Matrix { .. }
+            ) {
+                continue;
+            }
+            if let GuardedIndex::Expression(_) =
+                GuardedIndex::from_expression(index, &self.ir_function.expressions, self.ir_module)
+            {
+                self.function.spilled_at_definition.insert(base);
+            }
+        }
+    }
+
+    /// Store `expr`'s value to its temporary where the value is computed, if
+    /// an access subscripts it with a runtime index. The store dominates every
+    /// use of the value, so each access reads the temporary without storing
+    /// the whole composite again.
+    fn spill_at_definition(&mut self, expr: Handle<crate::Expression>, block: &mut Block) {
+        if self.cached.ids[expr] == 0 || !self.function.spilled_at_definition.contains(&expr) {
+            return;
+        }
+        self.function.stored_at_definition.remove(&expr);
+        self.spill_to_internal_variable(expr, block);
+        self.function.stored_at_definition.insert(expr);
+    }
+
     fn spill_to_internal_variable(&mut self, base: Handle<crate::Expression>, block: &mut Block) {
         use indexmap::map::Entry;
 
@@ -2941,6 +2980,11 @@ impl BlockContext<'_> {
                 id
             }
         };
+
+        // The value was stored where it was computed: the temporary holds it.
+        if self.function.stored_at_definition.contains(&base) {
+            return;
+        }
 
         // Perform the store even if we already had a spill variable for `base`.
         // Consider this code:
@@ -3908,6 +3952,9 @@ impl BlockContext<'_> {
                         self.writer.lookup_function[&local_function],
                         &self.temp_list,
                     ));
+                    if let Some(expr) = result {
+                        self.spill_at_definition(expr, &mut block);
+                    }
                 }
                 Statement::Atomic {
                     pointer,

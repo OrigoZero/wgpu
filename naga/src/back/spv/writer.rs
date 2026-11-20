@@ -1620,6 +1620,10 @@ impl Writer {
             ray_query_tracker_expr: crate::FastHashMap::default(),
         };
 
+        // The values a runtime index subscripts are spilled where they are
+        // computed, so every access reads the one store.
+        context.mark_spilled_at_definition();
+
         // fill up the pre-emitted and const expressions
         context.cached.reset(ir_function.expressions.len());
         for (handle, expr) in ir_function.expressions.iter() {

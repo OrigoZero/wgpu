@@ -78,11 +78,11 @@ OpExecutionMode %170 LocalSize 2 3 1
 %152 = OpConstant  %4  7
 %153 = OpConstant  %4  9
 %154 = OpConstantComposite  %13  %21 %22 %16 %19 %151 %47 %152 %23 %153
-%155 = OpConstantComposite  %6  %21 %22 %16 %19
-%157 = OpTypePointer Function %8
-%160 = OpConstantNull  %4
+%155 = OpTypePointer Function %13
+%157 = OpConstantComposite  %6  %21 %22 %16 %19
+%159 = OpTypePointer Function %8
 %162 = OpConstantNull  %4
-%164 = OpTypePointer Function %13
+%164 = OpConstantNull  %4
 %34 = OpFunction  %2  None %35
 %33 = OpLabel
 %37 = OpVariable  %38  Function %36
@@ -210,19 +210,19 @@ OpFunctionEnd
 %148 = OpFunction  %2  None %149
 %147 = OpFunctionParameter  %3
 %146 = OpLabel
-%158 = OpVariable  %139  Function %150
+%160 = OpVariable  %139  Function %150
+%163 = OpVariable  %43  Function %164
+%158 = OpVariable  %159  Function %97
 %161 = OpVariable  %43  Function %162
-%156 = OpVariable  %157  Function %97
-%159 = OpVariable  %43  Function %160
-%165 = OpVariable  %164  Function
-OpBranch %163
-%163 = OpLabel
-OpStore %165 %154
-%166 = OpAccessChain  %43  %165 %147
+%156 = OpVariable  %155  Function
+OpStore %156 %154
+OpBranch %165
+%165 = OpLabel
+%166 = OpAccessChain  %43  %156 %147
 %167 = OpLoad  %4  %166
-OpStore %159 %167
-%168 = OpVectorExtractDynamic  %4  %155 %147
-OpStore %161 %168
+OpStore %161 %167
+%168 = OpVectorExtractDynamic  %4  %157 %147
+OpStore %163 %168
 OpReturn
 OpFunctionEnd
 %170 = OpFunction  %2  None %35
