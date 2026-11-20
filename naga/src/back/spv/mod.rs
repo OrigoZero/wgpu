@@ -285,6 +285,22 @@ struct Function {
     /// [`spilled_composites`]: Function::spilled_composites
     spilled_accesses: crate::arena::HandleSet<crate::Expression>,
 
+    /// The expressions whose value an [`Access`] with a runtime index
+    /// subscripts: every one of them is spilled to its temporary in
+    /// [`spilled_composites`].
+    ///
+    /// [`Access`]: crate::Expression::Access
+    /// [`spilled_composites`]: Function::spilled_composites
+    spilled_at_definition: crate::FastHashSet<Handle<crate::Expression>>,
+
+    /// The expressions of [`spilled_at_definition`] whose value was stored to
+    /// their temporary where it was computed. That store dominates every use
+    /// of the value, so the temporary holds the value at every access, and an
+    /// access to it stores nothing.
+    ///
+    /// [`spilled_at_definition`]: Function::spilled_at_definition
+    stored_at_definition: crate::FastHashSet<Handle<crate::Expression>>,
+
     /// A map taking each expression to the number of [`Access`] and
     /// [`AccessIndex`] expressions that uses it as a base value. If an
     /// expression has no entry, its count is zero: it is never used as a

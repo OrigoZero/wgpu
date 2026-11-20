@@ -6,7 +6,7 @@ layout(location = 0) out vec4 _11;
 
 void main()
 {
-    int _19 = 0;
-    _11 = (_17[_19] * _17[_19]).xxyy;
+    int _21 = 0;
+    _11 = (_17[_21] * _17[_21]).xxyy;
 }
 
