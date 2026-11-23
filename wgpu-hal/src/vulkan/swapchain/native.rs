@@ -311,6 +311,7 @@ impl Surface for NativeSurface {
             surface_functor: self.functor.clone(),
             created_transform,
             presented_suboptimal: false,
+            fenced_acquire: None,
         }))
     }
 
@@ -390,6 +391,17 @@ pub(crate) struct NativeSwapchain {
     /// `VK_SUBOPTIMAL_KHR` and was reported as suboptimal. Presenting has no
     /// suboptimal answer to give, so the next acquire gives it.
     presented_suboptimal: bool,
+
+    /// An image `vkAcquireNextImageKHR` handed out whose [`fence`] had not
+    /// signalled when the acquire's timeout ran out: its index and whether the
+    /// acquire reports it suboptimal.
+    ///
+    /// The image is this swapchain's until it is presented, and the fence is
+    /// still pending, so the next acquire waits on the same fence again and
+    /// hands out this image instead of acquiring another.
+    ///
+    /// [`fence`]: NativeSwapchain::fence
+    fenced_acquire: Option<(u32, bool)>,
 }
 
 impl Drop for NativeSwapchain {
@@ -417,6 +429,12 @@ impl Swapchain for NativeSwapchain {
         };
 
         if let Some(fence) = self.fence {
+            // An acquire whose fence had not signalled when its timeout ran
+            // out leaves the fence pending on the presentation engine, which
+            // the idle wait above does not cover.
+            if self.fenced_acquire.take().is_some() {
+                let _ = unsafe { device.shared.raw.wait_for_fences(&[fence], true, u64::MAX) };
+            }
             unsafe { device.shared.raw.destroy_fence(fence, None) }
         }
 
@@ -494,43 +512,60 @@ impl Swapchain for NativeSwapchain {
         let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
 
         // will block if no image is available
-        let (index, suboptimal) = match unsafe {
-            profiling::scope!("vkAcquireNextImageKHR");
-            self.functor.acquire_next_image(
-                self.raw,
-                timeout_ns,
-                acquire_semaphore_guard.acquire,
-                acquire_fence,
-            )
-        } {
-            // See `NativeSwapchain::reports_suboptimal`.
-            Ok((index, suboptimal)) => (
-                index,
-                (suboptimal && self.reports_suboptimal())
-                    | core::mem::take(&mut self.presented_suboptimal),
-            ),
-            Err(error) => {
-                return match error {
-                    vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
-                    vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
-                        Err(crate::SurfaceError::Outdated)
-                    }
-                    vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
-                    // We don't use VK_EXT_full_screen_exclusive
-                    // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
-                    other => Err(map_host_device_oom_and_lost_err(other).into()),
-                };
+        let (index, suboptimal) = if let Some(fenced) = self.fenced_acquire {
+            // An image this swapchain already acquired, whose fence the last
+            // acquire stopped waiting on: it is waited on again below.
+            fenced
+        } else {
+            match unsafe {
+                profiling::scope!("vkAcquireNextImageKHR");
+                self.functor.acquire_next_image(
+                    self.raw,
+                    timeout_ns,
+                    acquire_semaphore_guard.acquire,
+                    acquire_fence,
+                )
+            } {
+                // See `NativeSwapchain::reports_suboptimal`.
+                Ok((index, suboptimal)) => (
+                    index,
+                    (suboptimal && self.reports_suboptimal())
+                        | core::mem::take(&mut self.presented_suboptimal),
+                ),
+                Err(error) => {
+                    return match error {
+                        vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
+                        vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                            Err(crate::SurfaceError::Outdated)
+                        }
+                        vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
+                        // We don't use VK_EXT_full_screen_exclusive
+                        // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+                        other => Err(map_host_device_oom_and_lost_err(other).into()),
+                    };
+                }
             }
         };
 
         if let Some(fence) = self.fence {
-            unsafe {
-                // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
-                self.device
-                    .raw
-                    .wait_for_fences(&[fence], true, timeout_ns)
-                    .map_err(map_host_device_oom_and_lost_err)?;
+            // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
+            match unsafe { self.device.raw.wait_for_fences(&[fence], true, timeout_ns) } {
+                Ok(()) => self.fenced_acquire = None,
+                // The fence signals once the presentation engine is done with
+                // the image, which a GPU busy past the timeout holds back. The
+                // image stays acquired and the fence pending: the next acquire
+                // waits on the same fence and hands this image out.
+                Err(vk::Result::TIMEOUT) => {
+                    self.fenced_acquire = Some((index, suboptimal));
+                    return Err(crate::SurfaceError::Timeout);
+                }
+                Err(other) => {
+                    self.fenced_acquire = None;
+                    return Err(map_host_device_oom_and_lost_err(other).into());
+                }
+            }
 
+            unsafe {
                 self.device
                     .raw
                     .reset_fences(&[fence])
