@@ -66,6 +66,13 @@ pub enum AccelerationStructureUpdateMode {
     Build,
     /// If possible, perform an incremental update.
     ///
+    /// A build updates the structure its last submitted build left when it reads the
+    /// same shape: for a BLAS, the same geometries with the same vertex, index and
+    /// primitive counts; for a TLAS, as many instances over the same bottom-level
+    /// structures, their transforms, custom data and masks free to change. Any other
+    /// build, and the build after `Blas::request_rebuild` or `Tlas::request_rebuild`,
+    /// builds the structure afresh.
+    ///
     /// Not advised for major topology changes.
     /// (Useful for e.g. skinning)
     PreferUpdate,
@@ -128,8 +135,9 @@ bitflags::bitflags!(
     #[cfg_attr(feature = "serde", serde(transparent))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct AccelerationStructureFlags: u8 {
-        /// Allow for incremental updates (no change in size), currently this is unimplemented
-        /// and will build as normal (this is fine, update vs build should be unnoticeable)
+        /// Allow for incremental updates (no change in size). A structure created with
+        /// [`AccelerationStructureUpdateMode::PreferUpdate`] carries it whether or not the
+        /// descriptor names it.
         const ALLOW_UPDATE = 1 << 0;
         /// Allow the acceleration structure to be compacted in a copy operation
         /// (`Blas::prepare_for_compaction`, `CommandEncoder::compact_blas`).

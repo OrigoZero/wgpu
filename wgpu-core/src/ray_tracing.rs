@@ -1,10 +1,7 @@
 // Ray tracing
 // Major missing optimizations (no api surface changes needed):
 // - use custom tracker to track build state
-// - no forced rebuilt (build mode deduction)
 // - lazy instance buffer allocation
-// - maybe share scratch and instance staging buffer allocation
-// - partial instance buffer uploads (api surface already designed with this in mind)
 // - Batch BLAS read-backs (if it shows up in performance).
 // - ([non performance] extract function in build (rust function extraction with guards is a pain))
 
@@ -213,6 +210,9 @@ pub enum BuildAccelerationStructureError {
 
     #[error("Blas {0:?} AABB stride is invalid (must be >= {1} and a multiple of 8)")]
     InvalidAabbStride(ResourceErrorIdent, BufferAddress),
+
+    #[error("Tlas {0:?} instance {1} is outside the {2} instances the descriptor at creation allows")]
+    TlasInstanceIndexOutOfRange(ResourceErrorIdent, u32, u32),
 }
 
 impl WebGpuError for BuildAccelerationStructureError {
@@ -249,7 +249,8 @@ impl WebGpuError for BuildAccelerationStructureError {
             | Self::BlasGeometryKindMismatch(..)
             | Self::IncompatibleBlasAabbPrimitiveCount(..)
             | Self::UnalignedAabbPrimitiveOffset(..)
-            | Self::InvalidAabbStride(..) => ErrorType::Validation,
+            | Self::InvalidAabbStride(..)
+            | Self::TlasInstanceIndexOutOfRange(..) => ErrorType::Validation,
         }
     }
 }
@@ -267,15 +268,19 @@ pub enum ValidateAsActionsError {
 
     #[error("Blas {0:?} is newer than the containing Tlas {1:?}")]
     BlasNewerThenTlas(ResourceErrorIdent, ResourceErrorIdent),
+
+    #[error("Acceleration structure {0:?} is updated, but the build submitted before it has another shape")]
+    UpdateSourceMismatch(ResourceErrorIdent),
 }
 
 impl WebGpuError for ValidateAsActionsError {
     fn webgpu_error_type(&self) -> ErrorType {
         match self {
             Self::DestroyedResource(e) => e.webgpu_error_type(),
-            Self::UsedUnbuiltTlas(..) | Self::UsedUnbuiltBlas(..) | Self::BlasNewerThenTlas(..) => {
-                ErrorType::Validation
-            }
+            Self::UsedUnbuiltTlas(..)
+            | Self::UsedUnbuiltBlas(..)
+            | Self::BlasNewerThenTlas(..)
+            | Self::UpdateSourceMismatch(..) => ErrorType::Validation,
         }
     }
 }
@@ -326,21 +331,63 @@ pub struct TlasInstance<'a> {
     pub mask: u8,
 }
 
+/// The instances of a TLAS written since its last build, each with its index.
+///
+/// The TLAS keeps every instance a build gave it, so a package names only the
+/// ones that changed; an index it does not name keeps its instance.
 pub struct TlasPackage<'a> {
     pub tlas_id: TlasId,
-    pub instances: Box<dyn Iterator<Item = Option<TlasInstance<'a>>> + 'a>,
+    pub instances: Box<dyn Iterator<Item = (u32, Option<TlasInstance<'a>>)> + 'a>,
     pub lowest_unmodified: u32,
+}
+
+/// What one geometry of a BLAS build read: an update of the BLAS has to read
+/// the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GeometryShape {
+    pub aabbs: bool,
+    pub vertex_count: u32,
+    pub index_count: Option<u32>,
+    pub primitive_count: u32,
+    pub transform: bool,
+    pub flags: AccelerationStructureGeometryFlags,
+}
+
+/// What a TLAS build read: an update of the TLAS has to read as many
+/// instances, over the same bottom-level structures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TlasShape {
+    pub instance_count: u32,
+    pub structure_version: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BlasBuilt {
+    pub blas: Arc<Blas>,
+    /// `None` for a structure marked built without a build.
+    pub shape: Option<Arc<[GeometryShape]>>,
+    pub updated: bool,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TlasBuild {
     pub tlas: Arc<Tlas>,
     pub dependencies: Vec<Arc<Blas>>,
+    /// `None` for a structure marked built without a build.
+    pub shape: Option<TlasShape>,
+    pub updated: bool,
+    /// The instances the build wrote into the instance buffer, each with the
+    /// version of the instance it wrote.
+    pub uploaded: Vec<(u32, u32)>,
+    /// Whether the build wrote the whole instance buffer.
+    pub wrote_whole: bool,
+    /// Which of the TLAS's encoded builds this is.
+    pub encode_index: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AsBuild {
-    pub blas_s_built: Vec<Arc<Blas>>,
+    pub blas_s_built: Vec<BlasBuilt>,
     pub tlas_s_built: Vec<TlasBuild>,
 }
 
@@ -424,7 +471,7 @@ pub type TraceTlasInstance = OwnedTlasInstance<IdReferences>;
 #[cfg_attr(feature = "serde", apply(serde_object_reference_struct))]
 pub struct OwnedTlasPackage<R: ReferenceType> {
     pub tlas: R::Tlas,
-    pub instances: Vec<Option<OwnedTlasInstance<R>>>,
+    pub instances: Vec<(u32, Option<OwnedTlasInstance<R>>)>,
     pub lowest_unmodified: u32,
 }
 

@@ -821,6 +821,9 @@ impl Device {
             inner: tlas,
             instances: vec![None; desc.max_instances as usize],
             lowest_unmodified: 0,
+            modified: crate::util::Mutex::new(crate::api::tlas::ModifiedInstances::with_capacity(
+                desc.max_instances as usize,
+            )),
         }
     }
 }

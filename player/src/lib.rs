@@ -1278,7 +1278,7 @@ impl Player {
             instances: package
                 .instances
                 .into_iter()
-                .map(|opt| opt.map(|inst| self.resolve_tlas_instance(inst)))
+                .map(|(index, opt)| (index, opt.map(|inst| self.resolve_tlas_instance(inst))))
                 .collect(),
             lowest_unmodified: package.lowest_unmodified,
         }

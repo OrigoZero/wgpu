@@ -235,8 +235,18 @@ impl Blas {
         unsafe { blas.context.blas_as_hal::<A>(blas) }
     }
 
-    #[cfg(custom)]
+    /// Make the next build of this BLAS build it from its geometry rather
+    /// than update it, whatever its [`AccelerationStructureUpdateMode`].
+    ///
+    /// An update keeps the structure's hierarchy and moves its bounds, so a
+    /// structure updated over many frames of deformation traces slower than a
+    /// fresh build; rebuilding every so often restores it.
+    pub fn request_rebuild(&self) {
+        self.inner.request_rebuild();
+    }
+
     /// Returns custom implementation of Blas (if custom backend and is internally T)
+    #[cfg(custom)]
     pub fn as_custom<T: crate::custom::BlasInterface>(&self) -> Option<&T> {
         self.inner.as_custom()
     }

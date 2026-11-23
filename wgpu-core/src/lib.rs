@@ -101,6 +101,7 @@ mod weak_vec;
 // See <https://github.com/gfx-rs/wgpu/issues/3103>, after which this can be
 // made private again.
 mod scratch;
+mod tlas_instances;
 pub mod validation;
 
 pub use validation::{map_storage_format_from_naga, map_storage_format_to_naga};
