@@ -221,6 +221,9 @@ pub struct Device {
     /// of.
     pub(crate) staging_pool: super::staging::StagingPool,
 
+    /// The free scratch buffers acceleration structure builds take.
+    pub(crate) scratch_pool: Mutex<crate::scratch::ScratchPool>,
+
     /// The counts `wgpu-core` keeps for the device, reported in
     /// [`wgt::InternalCounters::core`].
     pub(crate) counters: wgt::CoreCounters,
@@ -333,6 +336,7 @@ impl Drop for Device {
             timestamp_normalizer.dispose(self.raw.as_ref());
         }
         self.staging_pool.dispose(self.raw.as_ref());
+        self.scratch_pool.lock().dispose(self.raw.as_ref());
         unsafe {
             self.raw.destroy_buffer(zero_buffer);
             self.raw.destroy_bind_group_layout(empty_bgl);
@@ -538,6 +542,7 @@ impl Device {
             label: desc.label.to_string(),
             command_allocator,
             staging_pool: super::staging::StagingPool::new(),
+            scratch_pool: Mutex::new(rank::DEVICE_SCRATCH, Default::default()),
             counters: wgt::CoreCounters::default(),
             command_indices: RwLock::new(
                 rank::DEVICE_COMMAND_INDICES,
