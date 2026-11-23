@@ -107,6 +107,7 @@ macro_rules! define_lock_ranks {
 define_lock_ranks! {
     // Non-leaf ranks, in topological order.
     rank COMMAND_BUFFER_DATA "CommandBuffer::data" followed by {
+        DEVICE_SCRATCH,
         DEVICE_SNATCHABLE_LOCK,
         DEVICE_STAGING_POOL,
         BUFFER_MAP_STATE,
@@ -125,6 +126,7 @@ define_lock_ranks! {
         TEXTURE_INITIALIZATION_STATUS,
         QUEUE_LIFE_TRACKER,
         BLAS_COMPACTION_STATE,
+        DEVICE_SCRATCH,
         BUFFER_BIND_GROUPS,
         BUFFER_INITIALIZATION_STATUS,
         BUFFER_POOL,
@@ -148,6 +150,7 @@ define_lock_ranks! {
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
     rank QUEUE_PENDING_WRITES "Queue::pending_writes" followed by {
+        DEVICE_SCRATCH,
         BUFFER_MAP_STATE,
         DEVICE_TRACKERS,
         COMMAND_ALLOCATOR_FREE_ENCODERS,
@@ -163,6 +166,7 @@ define_lock_ranks! {
         TEXTURE_CLEAR_MODE,
     }
     rank QUEUE_LIFE_TRACKER "Queue::life_tracker" followed by {
+        DEVICE_SCRATCH,
         BUFFER_MAP_STATE,
         BUFFER_INITIALIZATION_STATUS,
         BUFFER_POOL,
@@ -206,6 +210,7 @@ define_lock_ranks! {
     rank BUFFER_INITIALIZATION_STATUS "Buffer::initialization_status" followed by { }
     rank BUFFER_POOL "BufferPool::buffers" followed by { }
     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by { }
+    rank DEVICE_SCRATCH "Device::scratch" followed by { }
     rank DEVICE_STAGING_POOL "StagingPool::free" followed by { }
     rank DEVICE_TRACE "Device::trace" followed by { }
     rank DEVICE_USAGE_SCOPES "Device::usage_scopes" followed by { }
