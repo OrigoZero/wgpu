@@ -40,6 +40,10 @@ impl Device {
             self.require_features(Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN)?;
         }
 
+        let mut blas_desc = blas_desc.clone();
+        blas_desc.flags |= update_flags(blas_desc.update_mode);
+        let blas_desc = &blas_desc;
+
         let size_info = match &sizes {
             wgt::BlasGeometrySizeDescriptors::Triangles { descriptors } => {
                 if descriptors.len() as u32 > self.limits.max_blas_geometry_count {
@@ -206,6 +210,8 @@ impl Device {
             tracking_data: TrackingData::new(self.tracker_indices.blas_s.clone()),
             compaction_buffer,
             compacted_state: Mutex::new(rank::BLAS_COMPACTION_STATE, BlasCompactState::Idle),
+            build_state: Mutex::new(rank::BLAS_BUILD_STATE, Default::default()),
+            rebuild_requested: core::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -238,6 +244,10 @@ impl Device {
         {
             self.require_features(Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN)?;
         }
+
+        let mut desc = desc.clone();
+        desc.flags |= update_flags(desc.update_mode);
+        let desc = &desc;
 
         let size_info = unsafe {
             self.raw().get_acceleration_structure_build_sizes(
@@ -290,10 +300,29 @@ impl Device {
             built_index: RwLock::new(rank::TLAS_BUILT_INDEX, None),
             dependencies: RwLock::new(rank::TLAS_DEPENDENCIES, Vec::new()),
             instance_buffer: ManuallyDrop::new(instance_buffer),
+            instances: Mutex::new(
+                rank::TLAS_INSTANCES,
+                crate::tlas_instances::TlasInstances::new(
+                    desc.max_instances,
+                    self.alignments.raw_tlas_instance_size,
+                ),
+            ),
+            rebuild_requested: core::sync::atomic::AtomicBool::new(false),
             label: desc.label.to_string(),
             max_instance_count: desc.max_instances,
             tracking_data: TrackingData::new(self.tracker_indices.tlas_s.clone()),
         }))
+    }
+}
+
+/// The flags a structure of `update_mode` is built with besides the ones its
+/// descriptor names: one that prefers updates is built so it can be updated.
+fn update_flags(update_mode: wgt::AccelerationStructureUpdateMode) -> wgt::AccelerationStructureFlags {
+    match update_mode {
+        wgt::AccelerationStructureUpdateMode::Build => wgt::AccelerationStructureFlags::empty(),
+        wgt::AccelerationStructureUpdateMode::PreferUpdate => {
+            wgt::AccelerationStructureFlags::ALLOW_UPDATE
+        }
     }
 }
 
@@ -428,6 +457,26 @@ impl Global {
                 Err(err)
             }
         }
+    }
+
+    /// Make the next build of the BLAS build it from its geometry, whatever
+    /// its update mode.
+    pub fn blas_request_rebuild(&self, blas_id: BlasId) -> Result<(), InvalidResourceError> {
+        api_log!("Blas::request_rebuild {blas_id:?}");
+        let blas = self.hub.blas_s.get(blas_id).get()?;
+        blas.rebuild_requested
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Make the next build of the TLAS build it from its instances, whatever
+    /// its update mode.
+    pub fn tlas_request_rebuild(&self, tlas_id: TlasId) -> Result<(), InvalidResourceError> {
+        api_log!("Tlas::request_rebuild {tlas_id:?}");
+        let tlas = self.hub.tlas_s.get(tlas_id).get()?;
+        tlas.rebuild_requested
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn ready_for_compaction(&self, blas_id: BlasId) -> Result<bool, InvalidResourceError> {

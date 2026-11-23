@@ -1,6 +1,6 @@
-use crate::{api::blas::TlasInstance, dispatch};
+use crate::{api::blas::TlasInstance, dispatch, util::Mutex};
 use crate::{BindingResource, Label};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 #[cfg(wgpu_core)]
 use core::ops::Deref;
 use core::ops::{Index, IndexMut, Range};
@@ -10,7 +10,7 @@ use wgt::WasmNotSendSync;
 pub type CreateTlasDescriptor<'a> = wgt::CreateTlasDescriptor<Label<'a>>;
 static_assertions::assert_impl_all!(CreateTlasDescriptor<'_>: Send, Sync);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Top Level Acceleration Structure (TLAS).
 ///
 /// A TLAS contains a series of [TLAS instances], which are a reference to
@@ -19,13 +19,71 @@ static_assertions::assert_impl_all!(CreateTlasDescriptor<'_>: Send, Sync);
 /// A TLAS also contains an extra set of TLAS instances in a device readable form, you cant interact
 /// directly with these, instead you have to build the TLAS with [TLAS instances].
 ///
+/// A build hands the device only the instances written since the TLAS was
+/// last built, so a build costs the CPU what changed rather than how many
+/// instances the TLAS holds.
+///
 /// [TLAS instances]: TlasInstance
 pub struct Tlas {
     pub(crate) inner: dispatch::DispatchTlas,
     pub(crate) instances: Vec<Option<TlasInstance>>,
     pub(crate) lowest_unmodified: u32,
+    pub(crate) modified: Mutex<ModifiedInstances>,
 }
 static_assertions::assert_impl_all!(Tlas: WasmNotSendSync);
+
+/// The instances of a [`Tlas`] written since its last build.
+#[derive(Debug, Default)]
+pub(crate) struct ModifiedInstances {
+    marked: Vec<bool>,
+    indices: Vec<u32>,
+}
+
+impl ModifiedInstances {
+    pub(crate) fn with_capacity(count: usize) -> Self {
+        Self {
+            marked: vec![false; count],
+            indices: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, range: Range<usize>) {
+        if self.marked.len() < range.end {
+            self.marked.resize(range.end, false);
+        }
+        for index in range {
+            if !self.marked[index] {
+                self.marked[index] = true;
+                self.indices.push(index as u32);
+            }
+        }
+    }
+
+    /// The instances written since the last call, in ascending order.
+    pub(crate) fn take(&mut self) -> Vec<u32> {
+        let mut indices = core::mem::take(&mut self.indices);
+        for &index in &indices {
+            self.marked[index as usize] = false;
+        }
+        indices.sort_unstable();
+        indices
+    }
+}
+
+impl Clone for Tlas {
+    /// A clone names the same acceleration structure, and its first build
+    /// hands the device every instance the clone holds.
+    fn clone(&self) -> Self {
+        let mut modified = ModifiedInstances::with_capacity(self.instances.len());
+        modified.mark(0..self.instances.len());
+        Self {
+            inner: self.inner.clone(),
+            instances: self.instances.clone(),
+            lowest_unmodified: self.lowest_unmodified,
+            modified: Mutex::new(modified),
+        }
+    }
+}
 
 crate::cmp::impl_eq_ord_hash_proxy!(Tlas => .inner);
 
@@ -92,6 +150,25 @@ impl Tlas {
         &self.instances
     }
 
+    /// Make the next build of this TLAS build it from its instances rather
+    /// than update it, whatever its [`AccelerationStructureUpdateMode`].
+    ///
+    /// An update keeps the structure's hierarchy and moves its bounds, so a
+    /// structure updated over many frames of motion traces slower than a
+    /// fresh build; rebuilding every so often restores it.
+    ///
+    /// [`AccelerationStructureUpdateMode`]: crate::AccelerationStructureUpdateMode
+    pub fn request_rebuild(&self) {
+        self.inner.request_rebuild();
+    }
+
+    /// The instances written since the last build, which the build hands to
+    /// the device.
+    #[cfg_attr(not(wgpu_core), expect(dead_code))]
+    pub(crate) fn take_modified(&self) -> Vec<u32> {
+        self.modified.lock().take()
+    }
+
     /// Get a mutable slice to a range of instances.
     /// Returns None if the range is out of bounds.
     /// All elements from the lowest accessed index up are marked as modified.
@@ -106,6 +183,7 @@ impl Tlas {
         if range.end as u32 > self.lowest_unmodified {
             self.lowest_unmodified = range.end as u32;
         }
+        self.modified.lock().mark(range.clone());
         Some(&mut self.instances[range])
     }
 
@@ -123,6 +201,7 @@ impl Tlas {
         if index as u32 + 1 > self.lowest_unmodified {
             self.lowest_unmodified = index as u32 + 1;
         }
+        self.modified.lock().mark(index..index + 1);
         Some(&mut self.instances[index])
     }
 
@@ -156,6 +235,7 @@ impl IndexMut<usize> for Tlas {
         if index as u32 + 1 > self.lowest_unmodified {
             self.lowest_unmodified = index as u32 + 1;
         }
+        self.modified.lock().mark(index..index + 1);
         idx
     }
 }
@@ -166,6 +246,7 @@ impl IndexMut<Range<usize>> for Tlas {
         if index.end > self.lowest_unmodified as usize {
             self.lowest_unmodified = index.end as u32;
         }
+        self.modified.lock().mark(index);
         idx
     }
 }

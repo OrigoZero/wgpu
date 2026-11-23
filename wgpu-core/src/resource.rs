@@ -2602,6 +2602,19 @@ pub struct Blas {
     pub(crate) tracking_data: TrackingData,
     pub(crate) compaction_buffer: Option<ManuallyDrop<Box<dyn hal::DynBuffer>>>,
     pub(crate) compacted_state: Mutex<BlasCompactState>,
+    /// The shapes of the last encoded and the last submitted build.
+    pub(crate) build_state: Mutex<BlasBuildState>,
+    /// Set by `Blas::request_rebuild`: the next build builds the structure
+    /// whatever its update mode.
+    pub(crate) rebuild_requested: core::sync::atomic::AtomicBool,
+}
+
+/// The shapes of a BLAS's last encoded and last submitted build: an update
+/// reads the shape both of them read.
+#[derive(Debug, Default)]
+pub(crate) struct BlasBuildState {
+    pub encoded: Option<Arc<[crate::ray_tracing::GeometryShape]>>,
+    pub submitted: Option<Arc<[crate::ray_tracing::GeometryShape]>>,
 }
 
 impl Drop for Blas {
@@ -2747,6 +2760,11 @@ pub struct Tlas {
     pub(crate) built_index: RwLock<Option<NonZeroU64>>,
     pub(crate) dependencies: RwLock<Vec<Arc<Blas>>>,
     pub(crate) instance_buffer: ManuallyDrop<Box<dyn hal::DynBuffer>>,
+    /// Every instance the TLAS was given, and what its instance buffer holds.
+    pub(crate) instances: Mutex<crate::tlas_instances::TlasInstances>,
+    /// Set by `Tlas::request_rebuild`: the next build builds the structure
+    /// whatever its update mode.
+    pub(crate) rebuild_requested: core::sync::atomic::AtomicBool,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,

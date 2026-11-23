@@ -108,6 +108,8 @@ define_lock_ranks! {
     // Non-leaf ranks, in topological order.
     rank COMMAND_BUFFER_DATA "CommandBuffer::data" followed by {
         DEVICE_SCRATCH,
+        TLAS_INSTANCES,
+        BLAS_BUILD_STATE,
         DEVICE_SNATCHABLE_LOCK,
         DEVICE_STAGING_POOL,
         BUFFER_MAP_STATE,
@@ -126,6 +128,8 @@ define_lock_ranks! {
         TEXTURE_INITIALIZATION_STATUS,
         QUEUE_LIFE_TRACKER,
         BLAS_COMPACTION_STATE,
+        BLAS_BUILD_STATE,
+        TLAS_INSTANCES,
         DEVICE_SCRATCH,
         BUFFER_BIND_GROUPS,
         BUFFER_INITIALIZATION_STATUS,
@@ -142,6 +146,8 @@ define_lock_ranks! {
         // COMMAND_BUFFER_DATA,
     }
     rank DEVICE_COMMAND_INDICES "Device::command_indices" followed by {
+        BLAS_BUILD_STATE,
+        TLAS_INSTANCES,
         BUFFER_POOL,
         QUEUE_PENDING_WRITES,
         QUEUE_LIFE_TRACKER,
@@ -205,6 +211,7 @@ define_lock_ranks! {
     }
 
     // Leaf ranks reachable from the graph above, alphabetical.
+    rank BLAS_BUILD_STATE "Blas::build_state" followed by { }
     rank BLAS_COMPACTION_STATE "Blas::compaction_state" followed by { }
     rank BUFFER_BIND_GROUPS "Buffer::bind_groups" followed by { }
     rank BUFFER_INITIALIZATION_STATUS "Buffer::initialization_status" followed by { }
@@ -220,6 +227,7 @@ define_lock_ranks! {
     rank TEXTURE_BIND_GROUPS "Texture::bind_groups" followed by { }
     rank TEXTURE_CLEAR_MODE "Texture::clear_mode" followed by { }
     rank TEXTURE_VIEWS "Texture::views" followed by { }
+    rank TLAS_INSTANCES "Tlas::instances" followed by { }
 
     // Ranks not connected to the graph, alphabetical.
     rank BLAS_BUILT_INDEX "Blas::built_index" followed by { }

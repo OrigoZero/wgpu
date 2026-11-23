@@ -613,7 +613,7 @@ pub struct CoreBlas {
 pub struct CoreTlas {
     pub(crate) context: ContextWgpuCore,
     id: wgc::id::TlasId,
-    // error_sink: ErrorSink,
+    error_sink: ErrorSink,
 }
 
 #[derive(Debug)]
@@ -1664,7 +1664,7 @@ impl dispatch::DeviceInterface for CoreDevice {
         CoreTlas {
             context: self.context.clone(),
             id,
-            // error_sink: Arc::clone(&self.error_sink),
+            error_sink: Arc::clone(&self.error_sink),
         }
         .into()
     }
@@ -2459,6 +2459,13 @@ impl dispatch::BlasInterface for CoreBlas {
             }
         }
     }
+
+    fn request_rebuild(&self) {
+        if let Err(cause) = self.context.0.blas_request_rebuild(self.id) {
+            self.context
+                .handle_error_nolabel(&self.error_sink, cause, "Blas::request_rebuild");
+        }
+    }
 }
 
 impl Drop for CoreBlas {
@@ -2467,7 +2474,14 @@ impl Drop for CoreBlas {
     }
 }
 
-impl dispatch::TlasInterface for CoreTlas {}
+impl dispatch::TlasInterface for CoreTlas {
+    fn request_rebuild(&self) {
+        if let Err(cause) = self.context.0.tlas_request_rebuild(self.id) {
+            self.context
+                .handle_error_nolabel(&self.error_sink, cause, "Tlas::request_rebuild");
+        }
+    }
+}
 
 impl Drop for CoreTlas {
     fn drop(&mut self) {
@@ -2959,19 +2973,17 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
         });
 
         let tlas = tlas.into_iter().map(|e| {
-            let instances = e
-                .instances
-                .iter()
-                .map(|instance: &Option<crate::TlasInstance>| {
-                    instance
-                        .as_ref()
-                        .map(|instance| wgc::ray_tracing::TlasInstance {
-                            blas_id: instance.blas.as_core().id,
-                            transform: &instance.transform,
-                            custom_data: instance.custom_data,
-                            mask: instance.mask,
-                        })
+            let instances = e.take_modified().into_iter().map(|index| {
+                let instance = e.instances[index as usize].as_ref().map(|instance| {
+                    wgc::ray_tracing::TlasInstance {
+                        blas_id: instance.blas.as_core().id,
+                        transform: &instance.transform,
+                        custom_data: instance.custom_data,
+                        mask: instance.mask,
+                    }
                 });
+                (index, instance)
+            });
             wgc::ray_tracing::TlasPackage {
                 tlas_id: e.inner.as_core().id,
                 instances: Box::new(instances),

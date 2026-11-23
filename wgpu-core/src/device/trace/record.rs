@@ -416,7 +416,7 @@ impl IntoTrace for crate::ray_tracing::OwnedTlasPackage<ArcReferences> {
             instances: self
                 .instances
                 .into_iter()
-                .map(|opt| opt.map(|inst| inst.into_trace()))
+                .map(|(index, opt)| (index, opt.map(|inst| inst.into_trace())))
                 .collect(),
             lowest_unmodified: self.lowest_unmodified,
         }

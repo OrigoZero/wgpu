@@ -316,8 +316,11 @@ pub trait ExternalTextureInterface: CommonTraits {
 pub trait BlasInterface: CommonTraits {
     fn prepare_compact_async(&self, callback: BlasCompactCallback);
     fn ready_for_compaction(&self) -> bool;
+    fn request_rebuild(&self);
 }
-pub trait TlasInterface: CommonTraits {}
+pub trait TlasInterface: CommonTraits {
+    fn request_rebuild(&self);
+}
 pub trait QuerySetInterface: CommonTraits {
     fn destroy(&self);
 }
