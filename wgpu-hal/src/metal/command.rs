@@ -1862,10 +1862,19 @@ impl crate::CommandEncoder for super::CommandEncoder {
                         );
                 }
                 crate::AccelerationStructureBuildMode::Update => unsafe {
+                    let destination = &descriptor.destination_acceleration_structure.raw;
+                    let source = descriptor
+                        .source_acceleration_structure
+                        .map_or(destination, |source| &source.raw);
+                    // A refit into the structure it reads names no destination.
+                    let in_place = core::ptr::eq(
+                        Retained::as_ptr(source),
+                        Retained::as_ptr(destination),
+                    );
                     command_encoder.refitAccelerationStructure_descriptor_destination_scratchBuffer_scratchBufferOffset(
-                        &descriptor.source_acceleration_structure.unwrap().raw,
+                        source,
                         &acceleration_structure_descriptor,
-                        Some(&descriptor.destination_acceleration_structure.raw),
+                        (!in_place).then_some(&**destination),
                         Some(&descriptor.scratch_buffer.raw),
                         descriptor.scratch_buffer_offset as usize,
                     );
