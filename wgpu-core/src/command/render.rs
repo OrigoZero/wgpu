@@ -2297,6 +2297,7 @@ pub(super) fn encode_render_pass(
     multiview_mask: Option<NonZeroU32>,
 ) -> Result<(), RenderPassError> {
     let pass_scope = PassErrorScope::Pass;
+    let start_mark = super::encode_profile::start();
 
     let device = parent_state.device;
 
@@ -2309,6 +2310,7 @@ pub(super) fn encode_render_pass(
         .begin_pass(base.label.as_deref())
         .map_pass_err(pass_scope)?;
 
+    let end_mark;
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
         let mut pending_discard_init_fixups = SurfacesInDiscardState::new();
@@ -2387,7 +2389,27 @@ pub(super) fn encode_render_pass(
             active_pipeline_statistics_query: None,
         };
 
+        super::encode_profile::record(
+            super::encode_profile::EncodeStage::RenderPassStart,
+            start_mark,
+        );
         for command in base.commands.drain(..) {
+            let command_mark = super::encode_profile::start();
+            let stage = match &command {
+                ArcRenderCommand::SetBindGroup { .. } => {
+                    super::encode_profile::EncodeStage::RenderSetBindGroup
+                }
+                ArcRenderCommand::SetPipeline(_) => {
+                    super::encode_profile::EncodeStage::RenderSetPipeline
+                }
+                ArcRenderCommand::Draw { .. }
+                | ArcRenderCommand::DrawIndexed { .. }
+                | ArcRenderCommand::DrawMeshTasks { .. }
+                | ArcRenderCommand::DrawIndirect { .. }
+                | ArcRenderCommand::MultiDrawIndirectCount { .. }
+                | ArcRenderCommand::ExecuteBundle(_) => super::encode_profile::EncodeStage::RenderDraw,
+                _ => super::encode_profile::EncodeStage::RenderOther,
+            };
             match command {
                 ArcRenderCommand::SetBindGroup {
                     index,
@@ -2672,7 +2694,9 @@ pub(super) fn encode_render_pass(
                     .map_pass_err(scope)?;
                 }
             }
+            super::encode_profile::record(stage, command_mark);
         }
+        end_mark = super::encode_profile::start();
 
         if *state.pass.base.debug_scope_depth > 0 {
             Err(
@@ -2753,6 +2777,7 @@ pub(super) fn encode_render_pass(
     }
 
     encoder.close_prelude().map_pass_err(pass_scope)?;
+    super::encode_profile::record(super::encode_profile::EncodeStage::RenderPassEnd, end_mark);
 
     Ok(())
 }

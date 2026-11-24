@@ -17,6 +17,7 @@ mod compute_command;
 mod draw;
 mod encoder;
 mod encoder_command;
+pub mod encode_profile;
 pub mod ffi;
 mod memory_init;
 mod pass;
@@ -1183,6 +1184,7 @@ impl CommandEncoder {
         }
 
         let commands = mem::take(&mut cmd_buf_data.commands);
+        let finish_mark = encode_profile::start();
 
         #[cfg(feature = "trace")]
         if device.trace.lock().is_some() {
@@ -1195,6 +1197,7 @@ impl CommandEncoder {
         }
 
         for command in commands {
+            let command_mark = encode_profile::start();
             if matches!(
                 command,
                 ArcCommand::RunRenderPass { .. }
@@ -1252,6 +1255,10 @@ impl CommandEncoder {
                                 api_log!("Finished encoding render pass (success)")
                             }
                         }
+                        encode_profile::record(
+                            encode_profile::EncodeStage::RenderPass,
+                            command_mark,
+                        );
                         res?;
                     }
                     ArcCommand::RunComputePass {
@@ -1263,6 +1270,10 @@ impl CommandEncoder {
                             pass.label.as_deref().unwrap_or("")
                         );
                         let res = compute::encode_compute_pass(&mut state, pass, timestamp_writes);
+                        encode_profile::record(
+                            encode_profile::EncodeStage::ComputePass,
+                            command_mark,
+                        );
                         match res.as_ref() {
                             Err(err) => {
                                 api_log!("Finished encoding compute pass ({err:?})")
@@ -1288,6 +1299,7 @@ impl CommandEncoder {
                             destination,
                             destination_offset,
                         )?;
+                        encode_profile::record(encode_profile::EncodeStage::Query, command_mark);
                     }
                     _ => unreachable!(),
                 }
@@ -1312,6 +1324,20 @@ impl CommandEncoder {
                     debug_scope_depth: &mut debug_scope_depth,
                     query_set_writes: &mut cmd_buf_data.query_set_writes,
                     deferred_query_set_resolves: &mut cmd_buf_data.deferred_query_set_resolves,
+                };
+                let stage = match &command {
+                    ArcCommand::CopyBufferToBuffer { .. }
+                    | ArcCommand::CopyBufferToTexture { .. }
+                    | ArcCommand::CopyTextureToBuffer { .. }
+                    | ArcCommand::CopyTextureToTexture { .. } => encode_profile::EncodeStage::Copy,
+                    ArcCommand::ClearBuffer { .. } | ArcCommand::ClearTexture { .. } => {
+                        encode_profile::EncodeStage::Clear
+                    }
+                    ArcCommand::WriteTimestamp { .. } => encode_profile::EncodeStage::Query,
+                    ArcCommand::BuildAccelerationStructures { .. } => {
+                        encode_profile::EncodeStage::AccelerationStructureBuild
+                    }
+                    _ => encode_profile::EncodeStage::Other,
                 };
                 match command {
                     ArcCommand::CopyBufferToBuffer {
@@ -1377,6 +1403,7 @@ impl CommandEncoder {
                         unreachable!()
                     }
                 }
+                encode_profile::record(stage, command_mark);
             }
         }
 
@@ -1387,7 +1414,11 @@ impl CommandEncoder {
         }
 
         // Close the encoder, unless it was closed already by a render or compute pass.
+        let close_mark = encode_profile::start();
         cmd_buf_data.encoder.close_if_open()?;
+        encode_profile::record(encode_profile::EncodeStage::Close, close_mark);
+        encode_profile::record_raw_command_buffers(cmd_buf_data.encoder.list.len());
+        encode_profile::record(encode_profile::EncodeStage::Finish, finish_mark);
 
         // Note: if we want to stop tracking the swapchain texture view,
         // this is the place to do it.
