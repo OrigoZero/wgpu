@@ -660,6 +660,7 @@ pub(super) fn encode_compute_pass(
     mut timestamp_writes: Option<ArcPassTimestampWrites>,
 ) -> Result<(), ComputePassError> {
     let pass_scope = PassErrorScope::Pass;
+    let start_mark = super::encode_profile::start();
 
     let device = parent_state.device;
 
@@ -779,8 +780,21 @@ pub(super) fn encode_compute_pass(
     unsafe {
         state.pass.base.raw_encoder.begin_compute_pass(&hal_desc);
     }
+    super::encode_profile::record(super::encode_profile::EncodeStage::ComputePassStart, start_mark);
 
     for command in base.commands.drain(..) {
+        let command_mark = super::encode_profile::start();
+        let stage = match &command {
+            ArcComputeCommand::SetBindGroup { .. } => {
+                super::encode_profile::EncodeStage::ComputeSetBindGroup
+            }
+            ArcComputeCommand::SetPipeline(_) => super::encode_profile::EncodeStage::ComputeSetPipeline,
+            ArcComputeCommand::DispatchWorkgroups(_)
+            | ArcComputeCommand::DispatchWorkgroupsIndirect { .. } => {
+                super::encode_profile::EncodeStage::ComputeDispatch
+            }
+            _ => super::encode_profile::EncodeStage::ComputeOther,
+        };
         match command {
             ArcComputeCommand::SetBindGroup {
                 index,
@@ -897,7 +911,9 @@ pub(super) fn encode_compute_pass(
                     .map_pass_err(scope)?;
             }
         }
+        super::encode_profile::record(stage, command_mark);
     }
+    let end_mark = super::encode_profile::start();
 
     if *state.pass.base.debug_scope_depth > 0 {
         Err(
@@ -943,6 +959,7 @@ pub(super) fn encode_compute_pass(
         .raw_encoder
         .close_prelude()
         .map_pass_err(pass_scope)?;
+    super::encode_profile::record(super::encode_profile::EncodeStage::ComputePassEnd, end_mark);
 
     Ok(())
 }
