@@ -66,6 +66,20 @@ impl PoolDevice for ash::Device {
 const POOL_MIN_SETS: u32 = 64;
 const POOL_MAX_SETS: u32 = 512;
 
+/// The most descriptors one pool holds room for, across its sets.
+///
+/// A driver reserves the memory of every descriptor a pool states when the
+/// pool is created, whether or not a set ever takes it: host memory for its
+/// own record of each descriptor and device memory for the descriptor itself
+/// (Mesa's ANV takes 48 bytes of zeroed host memory and 64 bytes of device
+/// memory a sampled image). A pool's set count therefore follows from this
+/// bound for a layout whose sets hold many descriptors, such as one with
+/// binding arrays of tens of thousands of elements: its pools hold as many of
+/// its sets as fit in the bound, and at least one. A layout of up to 128
+/// descriptors a set keeps every set count from [`POOL_MIN_SETS`] to
+/// [`POOL_MAX_SETS`].
+const POOL_MAX_DESCRIPTORS: u32 = 1 << 16;
+
 /// The dynamic counts are tracked separately since dynamic textures/buffers
 /// have distinct descriptor types compared to their non-dynamic counterparts.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -443,6 +457,10 @@ fn create_descriptor_pool<D: PoolDevice>(
         capacity = (u32::MAX / count.max(1)).min(capacity);
     }
 
+    // A pool of large sets holds as many of them as fit in the descriptor
+    // bound, and at least one.
+    capacity = capacity.min((POOL_MAX_DESCRIPTORS / key.counts.total().max(1)).max(1));
+
     let pool_sizes = counts
         .into_iter()
         .filter(|&(_, count)| count != 0)
@@ -514,6 +532,9 @@ mod tests {
         resets: Cell<u32>,
         created: Cell<u32>,
         destroyed: Cell<u32>,
+        /// The sets and descriptors each pool made states room for, in the
+        /// order the pools were made.
+        made: RefCell<Vec<(u32, u64)>>,
     }
 
     impl BumpDriver {
@@ -537,6 +558,13 @@ mod tests {
                 "a pool states at least one pool size"
             );
             let raw = self.handle();
+            // SAFETY: `info` states `pool_size_count` pool sizes at
+            // `p_pool_sizes`.
+            let sizes = unsafe {
+                core::slice::from_raw_parts(info.p_pool_sizes, info.pool_size_count as usize)
+            };
+            let descriptors = sizes.iter().map(|s| u64::from(s.descriptor_count)).sum();
+            self.made.borrow_mut().push((info.max_sets, descriptors));
             self.pools.borrow_mut().insert(
                 raw,
                 BumpPool {
@@ -618,6 +646,22 @@ mod tests {
             entries: Box::new([]),
             binding_map: Vec::new(),
             contains_binding_arrays: false,
+        }
+    }
+
+    /// A layout shaped like a bindless material group: two binding arrays of
+    /// 65,536 sampled images and one of 63 samplers.
+    fn binding_array_layout(raw: u64) -> super::super::BindGroupLayout {
+        super::super::BindGroupLayout {
+            raw: vk::DescriptorSetLayout::from_raw(raw),
+            desc_count: DescriptorCounts {
+                sampled_image: 2 * 65_536,
+                sampler: 63,
+                ..Default::default()
+            },
+            entries: Box::new([]),
+            binding_map: Vec::new(),
+            contains_binding_arrays: true,
         }
     }
 
@@ -723,6 +767,80 @@ mod tests {
             driver.destroyed.get(),
             "every pool is destroyed"
         );
+    }
+
+    /// A layout whose sets hold 131,135 descriptors makes pools that hold
+    /// room for one set each, so the memory a driver reserves for a pool
+    /// follows the sets the layout's bind groups take, and every set still
+    /// allocates. A layout of one storage buffer keeps its pool of 64 sets.
+    #[test]
+    fn a_pool_of_large_sets_holds_room_for_the_descriptor_bound() {
+        let driver = BumpDriver::default();
+        let mut allocator = DescriptorAllocator::new(u32::MAX);
+        let large = binding_array_layout(3);
+        let small = storage_buffer_layout(4);
+        allocator.register_layout(&driver, &large).unwrap();
+        allocator.register_layout(&driver, &small).unwrap();
+
+        let sets: Vec<_> = (0..5)
+            .map(|_| unsafe { allocator.alloc(&driver, &large) }.expect("a large set is allocated"))
+            .collect();
+        let small_set = unsafe { allocator.alloc(&driver, &small) }.unwrap();
+
+        let per_set = u64::from(large.desc_count.total());
+        let made = driver.made.borrow().clone();
+        for &(max_sets, descriptors) in &made {
+            if descriptors >= per_set {
+                assert_eq!(max_sets, 1, "a pool of large sets holds one: {made:?}");
+                assert_eq!(descriptors, per_set, "a pool states one set's descriptors: {made:?}");
+            }
+        }
+        assert_eq!(
+            made.iter().filter(|(_, d)| *d >= per_set).count(),
+            sets.len(),
+            "one pool for each live large set: {made:?}"
+        );
+        assert!(
+            made.contains(&(POOL_MIN_SETS, u64::from(POOL_MIN_SETS))),
+            "the storage buffer layout's pool holds {POOL_MIN_SETS} sets: {made:?}"
+        );
+
+        for set in sets {
+            unsafe { allocator.free(&driver, set) };
+        }
+        unsafe { allocator.free(&driver, small_set) };
+        allocator.unregister_layout(&driver, &large);
+        allocator.unregister_layout(&driver, &small);
+        assert_eq!(driver.created.get(), driver.destroyed.get(), "every pool is destroyed");
+    }
+
+    /// Large sets made and dropped frame after frame, a few live at once,
+    /// keep allocating, and the pools they take stay as many as the sets
+    /// live at the most.
+    #[test]
+    fn churn_of_large_sets_keeps_its_pools_to_the_sets_it_holds() {
+        let driver = BumpDriver::default();
+        let mut allocator = DescriptorAllocator::new(u32::MAX);
+        let layout = binding_array_layout(5);
+        allocator.register_layout(&driver, &layout).unwrap();
+
+        const LIVE: usize = 3;
+        let mut live = VecDeque::new();
+        let mut most_pools = 0;
+        for _ in 0..2_000 {
+            live.push_back(unsafe { allocator.alloc(&driver, &layout) }.expect("a large set is allocated"));
+            if live.len() > LIVE {
+                unsafe { allocator.free(&driver, live.pop_front().unwrap()) };
+            }
+            most_pools = most_pools.max(pools_of(&allocator, &layout));
+        }
+        assert!(most_pools <= LIVE + 1, "the pools stay bounded, held {most_pools}");
+
+        for set in live.drain(..) {
+            unsafe { allocator.free(&driver, set) };
+        }
+        allocator.unregister_layout(&driver, &layout);
+        assert_eq!(driver.created.get(), driver.destroyed.get(), "every pool is destroyed");
     }
 
     /// A layout with no bindings still makes a pool the driver accepts.
