@@ -240,36 +240,43 @@ impl crate::CommandEncoder for super::CommandEncoder {
     where
         T: Iterator<Item = crate::BufferBarrier<'a, super::Buffer>>,
     {
+        // The buffers' transitions are made as one global memory barrier over
+        // the union of their accesses. Buffer barriers carry no layout, and
+        // wgpu transfers no buffer between queue families, so a buffer barrier
+        // says nothing a memory barrier over the same accesses and stages
+        // leaves out; the memory barrier also covers every other buffer those
+        // stages touch, which orders more and never less. The driver handles
+        // one barrier however many buffers changed use, where it handled each
+        // buffer barrier on its own.
         //Note: this is done so that we never end up with empty stage flags
         let mut src_stages = vk::PipelineStageFlags::TOP_OF_PIPE;
         let mut dst_stages = vk::PipelineStageFlags::BOTTOM_OF_PIPE;
-        let vk_barriers = &mut self.temp.buffer_barriers;
-        vk_barriers.clear();
+        let mut src_accesses = vk::AccessFlags::empty();
+        let mut dst_accesses = vk::AccessFlags::empty();
+        let mut any = false;
 
         for bar in barriers {
             let (src_stage, src_access) = conv::map_buffer_usage_to_barrier(bar.usage.from);
             src_stages |= src_stage;
+            src_accesses |= src_access;
             let (dst_stage, dst_access) = conv::map_buffer_usage_to_barrier(bar.usage.to);
             dst_stages |= dst_stage;
-
-            vk_barriers.push(
-                vk::BufferMemoryBarrier::default()
-                    .buffer(bar.buffer.raw)
-                    .size(vk::WHOLE_SIZE)
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access),
-            )
+            dst_accesses |= dst_access;
+            any = true;
         }
 
-        if !vk_barriers.is_empty() {
+        if any {
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(src_accesses)
+                .dst_access_mask(dst_accesses);
             unsafe {
                 self.device.raw.cmd_pipeline_barrier(
                     self.active,
                     src_stages,
                     dst_stages,
                     vk::DependencyFlags::empty(),
+                    &[barrier],
                     &[],
-                    vk_barriers,
                     &[],
                 )
             };
