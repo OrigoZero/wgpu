@@ -948,14 +948,12 @@ impl crate::DynBindGroup for BindGroup {}
 #[derive(Default)]
 struct Temp {
     marker: Vec<u8>,
-    buffer_barriers: Vec<vk::BufferMemoryBarrier<'static>>,
     image_barriers: Vec<vk::ImageMemoryBarrier<'static>>,
 }
 
 impl Temp {
     fn clear(&mut self) {
         self.marker.clear();
-        self.buffer_barriers.clear();
         self.image_barriers.clear();
     }
 
