@@ -25,6 +25,7 @@ mod buffer_usages;
 mod clear_texture;
 mod clip_distances;
 mod cloneable_types;
+mod compute_pass_chain;
 mod compute_pass_ownership;
 mod compute_pass_transition_resources;
 mod create_surface_error;
@@ -101,6 +102,7 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
     clear_texture::all_tests(&mut tests);
     clip_distances::all_tests(&mut tests);
     cloneable_types::all_tests(&mut tests);
+    compute_pass_chain::all_tests(&mut tests);
     compute_pass_ownership::all_tests(&mut tests);
 
     #[cfg(wasm_test)]
