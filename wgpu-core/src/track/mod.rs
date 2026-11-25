@@ -515,6 +515,12 @@ impl RenderBundleScope {
 /// significant when a large number of resources have been used.
 pub(crate) type UsageScopePool = Mutex<Vec<(BufferUsageScope, TextureUsageScope)>>;
 
+/// The buffer and texture trackers a compute pass keeps the state of its
+/// dispatches in, kept for the next pass. Each is sized for every resource
+/// on the device, which a fresh one is again on the pass's first dispatch;
+/// a pooled one is already, and empties at the cost of what the pass used.
+pub(crate) type PassTrackerPool = Mutex<Vec<(BufferTracker, TextureTracker)>>;
+
 /// A usage scope tracker. Only needs to store stateful resources as stateless
 /// resources cannot possibly have a usage conflict.
 #[derive(Debug)]
@@ -653,6 +659,34 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
+    /// A tracker over buffer and texture trackers taken from `pool`, or new
+    /// ones when it holds none.
+    pub fn from_pool(
+        pool: &PassTrackerPool,
+        ordered_buffer_usages: wgt::BufferUses,
+        ordered_texture_usages: wgt::TextureUses,
+    ) -> Self {
+        let mut tracker = Self::new(ordered_buffer_usages, ordered_texture_usages);
+        if let Some((buffers, textures)) = pool.lock().pop() {
+            tracker.buffers = buffers;
+            tracker.textures = textures;
+        }
+        tracker
+    }
+
+    /// Empties the tracker's buffer and texture trackers and puts them in
+    /// `pool` for the next [`Tracker::from_pool`].
+    pub fn return_to_pool(self, pool: &PassTrackerPool) {
+        let Self {
+            mut buffers,
+            mut textures,
+            ..
+        } = self;
+        buffers.clear();
+        textures.clear();
+        pool.lock().push((buffers, textures));
+    }
+
     pub fn new(
         ordered_buffer_usages: wgt::BufferUses,
         ordered_texture_usages: wgt::TextureUses,
