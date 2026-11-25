@@ -342,6 +342,8 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
         indirect_buffer: Option<&Arc<Buffer>>,
         track_indirect_buffer: bool,
     ) -> Result<(), ComputePassErrorInner> {
+        use super::encode_profile::{record, start, EncodeStage};
+        let mark = start();
         for bind_group in self.pass.binder.list_active() {
             unsafe { self.pass.scope.merge_bind_group(&bind_group.used)? };
         }
@@ -380,13 +382,19 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 .remove_usage(buffer, wgt::BufferUses::INDIRECT);
         }
 
-        flush_bindings_helper(&mut self.pass)?;
+        record(EncodeStage::ComputeDispatchScope, mark);
 
+        let mark = start();
+        flush_bindings_helper(&mut self.pass)?;
+        record(EncodeStage::ComputeDispatchBind, mark);
+
+        let mark = start();
         CommandEncoder::drain_barriers(
             self.pass.base.raw_encoder,
             &mut self.intermediate_trackers,
             self.pass.base.snatch_guard,
         );
+        record(EncodeStage::ComputeDispatchBarriers, mark);
         Ok(())
     }
 }
@@ -1033,9 +1041,11 @@ fn dispatch_workgroups(state: &mut State, groups: [u32; 3]) -> Result<(), Comput
         ));
     }
 
+    let mark = super::encode_profile::start();
     unsafe {
         state.pass.base.raw_encoder.dispatch_workgroups(groups);
     }
+    super::encode_profile::record(super::encode_profile::EncodeStage::ComputeDispatchRecord, mark);
     Ok(())
 }
 

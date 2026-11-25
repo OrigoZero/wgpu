@@ -43,6 +43,17 @@ pub enum EncodeStage {
     ComputeSetPipeline,
     /// The dispatches of a compute pass, with the barriers each one settles.
     ComputeDispatch,
+    /// Within a compute dispatch: merging the bound groups into the
+    /// dispatch's usage scope and moving it into the pass's trackers.
+    ComputeDispatchScope,
+    /// Within a compute dispatch: the bind groups' init actions and the
+    /// backend's bind group calls.
+    ComputeDispatchBind,
+    /// Within a compute dispatch: the barriers drained from the trackers and
+    /// handed to the backend.
+    ComputeDispatchBarriers,
+    /// Within a compute dispatch: the backend's dispatch call.
+    ComputeDispatchRecord,
     /// Every other command of a compute pass.
     ComputeOther,
     /// A compute pass's end: its prelude's barriers and discard fixups.
@@ -77,6 +88,10 @@ impl EncodeStage {
         EncodeStage::ComputeSetBindGroup,
         EncodeStage::ComputeSetPipeline,
         EncodeStage::ComputeDispatch,
+        EncodeStage::ComputeDispatchScope,
+        EncodeStage::ComputeDispatchBind,
+        EncodeStage::ComputeDispatchBarriers,
+        EncodeStage::ComputeDispatchRecord,
         EncodeStage::ComputeOther,
         EncodeStage::ComputePassEnd,
         EncodeStage::Copy,
@@ -103,6 +118,10 @@ impl EncodeStage {
             EncodeStage::ComputeSetBindGroup => "compute_set_bind_group",
             EncodeStage::ComputeSetPipeline => "compute_set_pipeline",
             EncodeStage::ComputeDispatch => "compute_dispatch",
+            EncodeStage::ComputeDispatchScope => "compute_dispatch_scope",
+            EncodeStage::ComputeDispatchBind => "compute_dispatch_bind",
+            EncodeStage::ComputeDispatchBarriers => "compute_dispatch_barriers",
+            EncodeStage::ComputeDispatchRecord => "compute_dispatch_record",
             EncodeStage::ComputeOther => "compute_other",
             EncodeStage::ComputePassEnd => "compute_pass_end",
             EncodeStage::Copy => "copy",
@@ -115,7 +134,7 @@ impl EncodeStage {
     }
 }
 
-const STAGES: usize = 21;
+const STAGES: usize = 25;
 
 /// What the thread's finishes spent, stage by stage, since the account was
 /// last taken.
