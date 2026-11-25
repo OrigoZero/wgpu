@@ -117,6 +117,7 @@ define_lock_ranks! {
         BUFFER_POOL,
         DEVICE_TRACE,
         DEVICE_USAGE_SCOPES,
+        DEVICE_PASS_TRACKERS,
         HUB_OTHER,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
     }
@@ -136,6 +137,7 @@ define_lock_ranks! {
         BUFFER_POOL,
         DEVICE_TRACE,
         DEVICE_USAGE_SCOPES,
+        DEVICE_PASS_TRACKERS,
         HUB_OTHER,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
         TEXTURE_BIND_GROUPS,
@@ -221,6 +223,7 @@ define_lock_ranks! {
     rank DEVICE_STAGING_POOL "StagingPool::free" followed by { }
     rank DEVICE_TRACE "Device::trace" followed by { }
     rank DEVICE_USAGE_SCOPES "Device::usage_scopes" followed by { }
+    rank DEVICE_PASS_TRACKERS "Device::pass_trackers" followed by { }
     rank HUB_EXTERNAL_TEXTURES "Hub::external_textures" followed by { }
     rank SHARED_TRACKER_INDEX_ALLOCATOR_INNER "SharedTrackerIndexAllocator::inner" followed by { }
     rank QUERY_SET_INITIALIZED_SLOTS "QuerySet::initialized_slots" followed by { }

@@ -183,11 +183,6 @@ impl TextureStateSet {
         }
     }
 
-    fn clear(&mut self) {
-        self.simple.clear();
-        self.complex.clear();
-    }
-
     fn set_size(&mut self, size: usize) {
         self.simple.resize(size, TextureUses::UNINITIALIZED);
     }
@@ -284,9 +279,17 @@ impl TextureUsageScope {
         self.set.tracker_assert_in_bounds(index);
     }
 
+    /// Removes every texture from the scope, keeping its tables at their
+    /// size, so a pooled scope taken again for a device with as many
+    /// textures is already sized. The states of the textures it held go back
+    /// to uninitialized.
     pub fn clear(&mut self) {
-        self.set.clear();
-        self.metadata.clear();
+        for index in self.metadata.owned_indices() {
+            // SAFETY: an owned index is in bounds for the state set.
+            unsafe { *self.set.simple.get_unchecked_mut(index) = TextureUses::UNINITIALIZED };
+        }
+        self.set.complex.clear();
+        self.metadata.clear_owned();
     }
 
     /// Sets the size of all the vectors inside the tracker.
@@ -460,6 +463,22 @@ impl TextureTracker {
         self.end_set.set_size(size);
 
         self.metadata.set_size(size);
+    }
+
+    /// Removes every texture from the tracker, keeping its tables at their
+    /// size. The states of the textures it held go back to uninitialized.
+    pub fn clear(&mut self) {
+        for index in self.metadata.owned_indices() {
+            // SAFETY: an owned index is in bounds for both state sets.
+            unsafe {
+                *self.start_set.simple.get_unchecked_mut(index) = TextureUses::UNINITIALIZED;
+                *self.end_set.simple.get_unchecked_mut(index) = TextureUses::UNINITIALIZED;
+            }
+        }
+        self.start_set.complex.clear();
+        self.end_set.complex.clear();
+        self.metadata.clear_owned();
+        self.temp.clear();
     }
 
     /// Extend the vectors to let the given index be valid.

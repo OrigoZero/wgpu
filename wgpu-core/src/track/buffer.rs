@@ -91,9 +91,15 @@ impl BufferUsageScope {
         strict_assert!(index < self.state.len());
         self.metadata.tracker_assert_in_bounds(index);
     }
+    /// Removes every buffer from the scope, keeping its tables at their size,
+    /// so a pooled scope taken again for a device with as many buffers is
+    /// already sized. The states of the buffers it held go back to empty.
     pub fn clear(&mut self) {
-        self.state.clear();
-        self.metadata.clear();
+        for index in self.metadata.owned_indices() {
+            // SAFETY: an owned index is in bounds for `state`.
+            unsafe { *self.state.get_unchecked_mut(index) = BufferUses::empty() };
+        }
+        self.metadata.clear_owned();
     }
 
     /// Sets the size of all the vectors inside the tracker.
@@ -318,6 +324,20 @@ impl BufferTracker {
         self.end.resize(size, BufferUses::empty());
 
         self.metadata.set_size(size);
+    }
+
+    /// Removes every buffer from the tracker, keeping its tables at their
+    /// size. The states of the buffers it held go back to empty.
+    pub fn clear(&mut self) {
+        for index in self.metadata.owned_indices() {
+            // SAFETY: an owned index is in bounds for `start` and `end`.
+            unsafe {
+                *self.start.get_unchecked_mut(index) = BufferUses::empty();
+                *self.end.get_unchecked_mut(index) = BufferUses::empty();
+            }
+        }
+        self.metadata.clear_owned();
+        self.temp.clear();
     }
 
     /// Extend the vectors to let the given index be valid.

@@ -712,7 +712,8 @@ pub(super) fn encode_compute_pass(
 
         immediate_slots_set: Default::default(),
 
-        intermediate_trackers: Tracker::new(
+        intermediate_trackers: Tracker::from_pool(
+            &device.pass_trackers,
             device.ordered_buffer_usages,
             device.ordered_texture_usages,
         ),
@@ -963,6 +964,7 @@ pub(super) fn encode_compute_pass(
         &intermediate_trackers,
         parent_state.snatch_guard,
     );
+    intermediate_trackers.return_to_pool(&device.pass_trackers);
     parent_state
         .raw_encoder
         .close_prelude()

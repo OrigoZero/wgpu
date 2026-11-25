@@ -284,6 +284,7 @@ pub struct Device {
     pub(crate) instance_flags: wgt::InstanceFlags,
     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
     pub(crate) usage_scopes: UsageScopePool,
+    pub(crate) pass_trackers: crate::track::PassTrackerPool,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
     // Optional so that we can late-initialize this after the queue is created.
     pub(crate) timestamp_normalizer:
@@ -574,6 +575,7 @@ impl Device {
             instance_flags,
             deferred_destroy: Mutex::new(rank::DEVICE_DEFERRED_DESTROY, Vec::new()),
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
+            pass_trackers: Mutex::new(rank::DEVICE_PASS_TRACKERS, Vec::new()),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,
         })

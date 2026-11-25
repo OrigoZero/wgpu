@@ -34,8 +34,14 @@ impl<T: Clone> ResourceMetadata<T> {
         resize_bitvec(&mut self.owned, size);
     }
 
-    pub(super) fn clear(&mut self) {
-        self.resources.clear();
+    /// Removes every member, keeping the tables at their size: the work is
+    /// the members', not the tables' length, so a set sized for every
+    /// resource on the device empties at the cost of what it held.
+    pub(super) fn clear_owned(&mut self) {
+        for index in iterate_bitvec_indices(&self.owned) {
+            // SAFETY: an owned index is in bounds for `resources`.
+            unsafe { *self.resources.get_unchecked_mut(index) = None };
+        }
         self.owned.fill(false);
     }
 
