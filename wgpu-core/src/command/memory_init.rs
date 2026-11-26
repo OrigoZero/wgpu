@@ -40,6 +40,12 @@ pub(crate) struct CommandBufferTextureMemoryActions {
 }
 
 impl CommandBufferTextureMemoryActions {
+    /// Whether a surface discarded by this command buffer waits to be
+    /// cleared before it is read.
+    pub(crate) fn holds_discards(&self) -> bool {
+        !self.discards.is_empty()
+    }
+
     pub(crate) fn drain_init_actions(&mut self) -> Drain<'_, TextureInitTrackerAction> {
         self.init_actions.drain(..)
     }

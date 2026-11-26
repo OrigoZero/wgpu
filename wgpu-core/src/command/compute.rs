@@ -276,6 +276,26 @@ struct State<'scope, 'snatch_guard, 'cmd_enc> {
     immediate_slots_set: naga::valid::ImmediateSlots,
 
     intermediate_trackers: Tracker,
+
+    /// Whether the pass records its barriers inline, against the encoder's
+    /// own tracker, rather than into a prelude executed ahead of it: see
+    /// [`encode_compute_pass`].
+    inline: bool,
+}
+
+/// The tracker a compute pass sets each dispatch's usage into and drains its
+/// barriers from: the encoder's own when the pass records its barriers
+/// inline, the pass's intermediate tracker otherwise.
+fn transit_tracker<'t>(
+    inline: bool,
+    intermediate: &'t mut Tracker,
+    encoder: &'t mut Tracker,
+) -> &'t mut Tracker {
+    if inline {
+        encoder
+    } else {
+        intermediate
+    }
 }
 
 impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
@@ -363,18 +383,20 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
         // dropping `UsageScope`s is significant (even with the pool), we
         // add and then remove usage from a single usage scope.
 
+        let tracker = transit_tracker(
+            self.inline,
+            &mut self.intermediate_trackers,
+            self.pass.base.tracker,
+        );
         for bind_group in self.pass.binder.list_active() {
-            self.intermediate_trackers
-                .set_and_remove_from_usage_scope_sparse(&mut self.pass.scope, &bind_group.used);
+            tracker.set_and_remove_from_usage_scope_sparse(&mut self.pass.scope, &bind_group.used);
         }
 
         if track_indirect_buffer {
-            self.intermediate_trackers
-                .buffers
-                .set_and_remove_from_usage_scope_sparse(
-                    &mut self.pass.scope.buffers,
-                    indirect_buffer.map(|buf| buf.tracker_index()),
-                );
+            tracker.buffers.set_and_remove_from_usage_scope_sparse(
+                &mut self.pass.scope.buffers,
+                indirect_buffer.map(|buf| buf.tracker_index()),
+            );
         } else if let Some(buffer) = indirect_buffer {
             self.pass
                 .scope
@@ -391,7 +413,11 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
         let mark = start();
         CommandEncoder::drain_barriers(
             self.pass.base.raw_encoder,
-            &mut self.intermediate_trackers,
+            transit_tracker(
+                self.inline,
+                &mut self.intermediate_trackers,
+                self.pass.base.tracker,
+            ),
             self.pass.base.snatch_guard,
         );
         record(EncodeStage::ComputeDispatchBarriers, mark);
@@ -427,10 +453,13 @@ fn transition_resources(
         buffer_ids.push(buffer_transition.buffer.tracker_index());
     }
 
-    state
-        .intermediate_trackers
-        .buffers
-        .set_and_remove_from_usage_scope_sparse(&mut state.pass.scope.buffers, buffer_ids);
+    transit_tracker(
+        state.inline,
+        &mut state.intermediate_trackers,
+        state.pass.base.tracker,
+    )
+    .buffers
+    .set_and_remove_from_usage_scope_sparse(&mut state.pass.scope.buffers, buffer_ids);
 
     // Process texture transitions
     for texture_transition in texture_transitions {
@@ -449,15 +478,22 @@ fn transition_resources(
         textures.insert_single(texture_transition.texture, texture_transition.state);
     }
 
-    state
-        .intermediate_trackers
-        .textures
-        .set_and_remove_from_usage_scope_sparse(&mut state.pass.scope.textures, &textures);
+    transit_tracker(
+        state.inline,
+        &mut state.intermediate_trackers,
+        state.pass.base.tracker,
+    )
+    .textures
+    .set_and_remove_from_usage_scope_sparse(&mut state.pass.scope.textures, &textures);
 
     // Record any needed barriers based on tracker data
     CommandEncoder::drain_barriers(
         state.pass.base.raw_encoder,
-        &mut state.intermediate_trackers,
+        transit_tracker(
+            state.inline,
+            &mut state.intermediate_trackers,
+            state.pass.base.tracker,
+        ),
         state.pass.base.snatch_guard,
     );
     Ok(())
@@ -672,12 +708,27 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // The pass's prelude is recorded after the pass and executes ahead of it:
-    // see `InnerCommandEncoder::begin_pass`.
-    let raw_encoder = parent_state
-        .raw_encoder
-        .begin_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // The encoder is encoded once it is finished, so its tracker holds the
+    // state every resource is left in by the commands recorded before this
+    // pass. A dispatch's usage is then set into that tracker directly, and
+    // its barriers are recorded inline, ahead of the dispatch, into the
+    // command buffer the encoder is recording: the pass needs no prelude and
+    // no command buffer of its own. Barriers inside a compute pass are what
+    // every dispatch after the first already records.
+    //
+    // The one thing a compute pass needs ahead of it that cannot be recorded
+    // inside it is the clear of a surface a render pass discarded, which a
+    // dispatch reading it calls for. An encoder holding no discarded surface
+    // has none to clear (a compute pass discards none), so the pass is
+    // inline; otherwise its prelude is recorded after the pass and executes
+    // ahead of it: see `InnerCommandEncoder::begin_pass`.
+    let inline = !parent_state.texture_memory_actions.holds_discards();
+    let raw_encoder = if inline {
+        parent_state.raw_encoder.open()
+    } else {
+        parent_state.raw_encoder.begin_pass(base.label.as_deref())
+    }
+    .map_pass_err(pass_scope)?;
 
     let mut debug_scope_depth = 0;
 
@@ -717,6 +768,8 @@ pub(super) fn encode_compute_pass(
             device.ordered_buffer_usages,
             device.ordered_texture_usages,
         ),
+
+        inline,
     };
 
     let indices = &device.tracker_indices;
@@ -789,7 +842,10 @@ pub(super) fn encode_compute_pass(
     unsafe {
         state.pass.base.raw_encoder.begin_compute_pass(&hal_desc);
     }
-    super::encode_profile::record(super::encode_profile::EncodeStage::ComputePassStart, start_mark);
+    super::encode_profile::record(
+        super::encode_profile::EncodeStage::ComputePassStart,
+        start_mark,
+    );
 
     for command in base.commands.drain(..) {
         let command_mark = super::encode_profile::start();
@@ -797,7 +853,9 @@ pub(super) fn encode_compute_pass(
             ArcComputeCommand::SetBindGroup { .. } => {
                 super::encode_profile::EncodeStage::ComputeSetBindGroup
             }
-            ArcComputeCommand::SetPipeline(_) => super::encode_profile::EncodeStage::ComputeSetPipeline,
+            ArcComputeCommand::SetPipeline(_) => {
+                super::encode_profile::EncodeStage::ComputeSetPipeline
+            }
             ArcComputeCommand::DispatchWorkgroups(_)
             | ArcComputeCommand::DispatchWorkgroupsIndirect { .. } => {
                 super::encode_profile::EncodeStage::ComputeDispatch
@@ -944,9 +1002,21 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
+    if inline {
+        // Every barrier was recorded inline, and with no discarded surface in
+        // the encoder no dispatch asked for a clear.
+        debug_assert!(pending_discard_init_fixups.is_empty());
+        intermediate_trackers.return_to_pool(&device.pass_trackers);
+        super::encode_profile::record(super::encode_profile::EncodeStage::ComputePassEnd, end_mark);
+        return Ok(());
+    }
+
     // The pass is recorded; its prelude (barriers and the clears of discarded
     // images) executes ahead of it.
-    parent_state.raw_encoder.end_pass().map_pass_err(pass_scope)?;
+    parent_state
+        .raw_encoder
+        .end_pass()
+        .map_pass_err(pass_scope)?;
     let transit = parent_state
         .raw_encoder
         .open_prelude()
@@ -1047,7 +1117,10 @@ fn dispatch_workgroups(state: &mut State, groups: [u32; 3]) -> Result<(), Comput
     unsafe {
         state.pass.base.raw_encoder.dispatch_workgroups(groups);
     }
-    super::encode_profile::record(super::encode_profile::EncodeStage::ComputeDispatchRecord, mark);
+    super::encode_profile::record(
+        super::encode_profile::EncodeStage::ComputeDispatchRecord,
+        mark,
+    );
     Ok(())
 }
 
@@ -1140,10 +1213,13 @@ fn dispatch_workgroups_indirect(
             );
         }
 
-        let src_transition = state
-            .intermediate_trackers
-            .buffers
-            .set_single(&buffer, wgt::BufferUses::STORAGE_READ_ONLY);
+        let src_transition = transit_tracker(
+            state.inline,
+            &mut state.intermediate_trackers,
+            state.pass.base.tracker,
+        )
+        .buffers
+        .set_single(&buffer, wgt::BufferUses::STORAGE_READ_ONLY);
         let src_barrier = src_transition
             .map(|transition| transition.into_hal(&buffer, state.pass.base.snatch_guard));
         unsafe {
