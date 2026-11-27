@@ -24,7 +24,7 @@ use super::{OsFeatures, TimestampQuerySupport};
 /// before sending a message. We use it to skip method calls that would panic
 /// on proxy objects like Apple's `CaptureMTLDevice`, which forwards messages
 /// at runtime but doesn't declare the methods in its class.
-fn device_class_responds_to(device: &ProtocolObject<dyn MTLDevice>, sel: Sel) -> bool {
+pub(super) fn device_class_responds_to(device: &ProtocolObject<dyn MTLDevice>, sel: Sel) -> bool {
     AnyObject::class(device.as_ref()).responds_to(sel)
 }
 

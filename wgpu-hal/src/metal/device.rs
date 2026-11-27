@@ -6,8 +6,9 @@ use objc2::{
     available,
     rc::{autoreleasepool, Retained},
     runtime::ProtocolObject,
+    sel,
 };
-use objc2_foundation::{ns_string, NSError, NSRange, NSString, NSUInteger};
+use objc2_foundation::{ns_string, NSError, NSProcessInfo, NSRange, NSString, NSUInteger};
 use objc2_metal::{
     MTLAccelerationStructure, MTLAccelerationStructureInstanceOptions, MTLBuffer,
     MTLCaptureManager, MTLCaptureScope, MTLCompileOptions, MTLComputePipelineDescriptor,
@@ -24,7 +25,10 @@ use objc2_metal::{
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use super::{adapter::MAX_BUFFERS, conv, PassthroughShader, ShaderModuleSource};
+use super::{
+    adapter::{device_class_responds_to, MAX_BUFFERS},
+    conv, PassthroughShader, ShaderModuleSource,
+};
 use crate::{auxil::map_naga_stage, DropCallback, DropGuard, TlasInstance};
 
 type DeviceResult<T> = Result<T, crate::DeviceError>;
@@ -2160,6 +2164,32 @@ impl crate::Device for super::Device {
 
     fn get_internal_counters(&self) -> wgt::HalCounters {
         self.counters.as_ref().clone()
+    }
+
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        let device = &self.shared.device;
+        if !device_class_responds_to(device, sel!(recommendedMaxWorkingSetSize))
+            || !device_class_responds_to(device, sel!(currentAllocatedSize))
+        {
+            return Err(wgt::MemoryBudgetUnavailable::new(
+                "the Metal device does not respond to recommendedMaxWorkingSetSize and currentAllocatedSize",
+            ));
+        }
+        let recommended = device.recommendedMaxWorkingSetSize();
+        let size = if self.shared.private_caps.device_type() == wgt::DeviceType::IntegratedGpu {
+            NSProcessInfo::processInfo().physicalMemory()
+        } else {
+            recommended
+        };
+        Ok(wgt::MemoryBudgetReport {
+            heaps: vec![wgt::MemoryHeapBudget {
+                size,
+                budget: Some(recommended),
+                usage: Some(device.currentAllocatedSize() as u64),
+                device_local: true,
+            }],
+            budget_unavailable: None,
+        })
     }
 
     fn check_if_oom(&self) -> Result<(), crate::DeviceError> {
