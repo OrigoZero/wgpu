@@ -210,6 +210,66 @@ pub struct AllocatorReport {
     pub total_reserved_bytes: u64,
 }
 
+/// One memory heap a device allocates from, as the backend states it.
+///
+/// `budget` is what the operating system states this process may hold in the
+/// heap now. It is a statement of the system, not a bound the heap enforces: it
+/// can exceed `size` (NVIDIA's Vulkan driver states a budget of 102135 MiB for a
+/// host heap of 64314 MiB), and `usage` can exceed `budget`. A consumer that
+/// computes the headroom a process has reads `budget` and `usage` on the
+/// device-local heaps and treats a heap whose figures are `None` as one the
+/// backend did not state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryHeapBudget {
+    /// The size in bytes of the heap.
+    pub size: u64,
+    /// The bytes the operating system states this process may hold in the heap
+    /// now, or `None` when the backend states no budget for it.
+    pub budget: Option<u64>,
+    /// The bytes this process holds in the heap now, or `None` when the backend
+    /// states no usage for it.
+    pub usage: Option<u64>,
+    /// Whether the heap is local to the GPU: device memory on a discrete GPU, the
+    /// memory the GPU shares with the CPU on an integrated one.
+    pub device_local: bool,
+}
+
+/// The memory heaps of a device with the budget and usage the backend states for
+/// each, as returned by `Device::memory_budget()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryBudgetReport {
+    /// Every heap the backend states.
+    pub heaps: Vec<MemoryHeapBudget>,
+    /// Why some heap's `budget` and `usage` are `None`, where the backend states
+    /// heap sizes and cannot state a budget for them (or for one of them): the
+    /// driver removes the budget extension, or a query for one heap failed.
+    pub budget_unavailable: Option<String>,
+}
+
+/// Why a device states no memory heaps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryBudgetUnavailable {
+    /// The reason, in a sentence.
+    pub reason: String,
+}
+
+impl MemoryBudgetUnavailable {
+    /// An answer that states `reason`.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for MemoryBudgetUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl core::error::Error for MemoryBudgetUnavailable {}
+
 impl fmt::Debug for AllocationReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = if !self.name.is_empty() {

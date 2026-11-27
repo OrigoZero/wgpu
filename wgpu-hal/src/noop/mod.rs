@@ -481,6 +481,12 @@ impl crate::Device for Context {
         Default::default()
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        Err(wgt::MemoryBudgetUnavailable::new(
+            "the noop backend has no GPU memory",
+        ))
+    }
+
     fn check_if_oom(&self) -> DeviceResult<()> {
         Ok(())
     }

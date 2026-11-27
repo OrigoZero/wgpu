@@ -1884,6 +1884,10 @@ impl dispatch::DeviceInterface for CoreDevice {
         self.context.0.device_generate_allocator_report(self.id)
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        self.context.0.device_memory_budget(self.id)
+    }
+
     fn destroy(&self) {
         self.context.0.device_destroy(self.id);
     }
