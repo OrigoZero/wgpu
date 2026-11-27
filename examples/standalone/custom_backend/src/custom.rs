@@ -191,6 +191,20 @@ impl DeviceInterface for CustomDevice {
         wgpu::custom::DispatchComputePipeline::custom(CustomComputePipeline(module.0.clone()))
     }
 
+    fn create_render_pipeline_async(
+        &self,
+        _desc: &wgpu::RenderPipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn wgpu::custom::CreateRenderPipelineFuture>> {
+        unimplemented!()
+    }
+
+    fn create_compute_pipeline_async(
+        &self,
+        _desc: &wgpu::ComputePipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn wgpu::custom::CreateComputePipelineFuture>> {
+        unimplemented!()
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _desc: &wgpu::PipelineCacheDescriptor<'_>,
@@ -288,6 +302,12 @@ impl DeviceInterface for CustomDevice {
 
     fn generate_allocator_report(&self) -> Option<wgpu::AllocatorReport> {
         unimplemented!()
+    }
+
+    fn memory_budget(&self) -> Result<wgpu::MemoryBudgetReport, wgpu::MemoryBudgetUnavailable> {
+        Err(wgpu::MemoryBudgetUnavailable::new(
+            "the custom backend states no GPU memory heaps",
+        ))
     }
 
     fn destroy(&self) {
