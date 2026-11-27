@@ -520,6 +520,9 @@ struct DeviceShared {
     instance: Arc<InstanceShared>,
     physical_device: vk::PhysicalDevice,
     enabled_extensions: Vec<&'static CStr>,
+    /// Whether the driver offers `VK_EXT_memory_budget` and wgpu leaves it
+    /// disabled for that driver.
+    removes_memory_budget_extension: bool,
     extension_fns: DeviceExtensionFunctions,
     vendor_id: u32,
     pipeline_cache_validation_key: [u8; 16],

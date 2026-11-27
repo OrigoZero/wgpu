@@ -2911,6 +2911,9 @@ impl super::Adapter {
             instance: Arc::clone(&self.instance),
             physical_device: self.raw,
             enabled_extensions: enabled_extensions.into(),
+            removes_memory_budget_extension: self
+                .phd_capabilities
+                .is_driver(vk::DriverId::MESA_RADV),
             extension_fns: super::DeviceExtensionFunctions {
                 debug_utils: debug_utils_fn,
                 draw_indirect_count: indirect_count_fn,
