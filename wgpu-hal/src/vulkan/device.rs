@@ -3063,6 +3063,55 @@ impl crate::Device for super::Device {
         })
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        let device_local =
+            |heap: &vk::MemoryHeap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+
+        if let Some(properties) = self.get_memory_properties() {
+            let heaps = properties
+                .heaps()
+                .iter()
+                .zip(properties.heap_budget())
+                .zip(properties.heap_usage())
+                .map(|((heap, &budget), &usage)| wgt::MemoryHeapBudget {
+                    size: heap.size,
+                    budget: Some(budget),
+                    usage: Some(usage),
+                    device_local: device_local(heap),
+                })
+                .collect();
+            return Ok(wgt::MemoryBudgetReport {
+                heaps,
+                budget_unavailable: None,
+            });
+        }
+
+        let properties = unsafe {
+            self.shared
+                .instance
+                .raw
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        let heaps = properties.memory_heaps[..properties.memory_heap_count as usize]
+            .iter()
+            .map(|heap| wgt::MemoryHeapBudget {
+                size: heap.size,
+                budget: None,
+                usage: None,
+                device_local: device_local(heap),
+            })
+            .collect();
+        let reason = if self.shared.removes_memory_budget_extension {
+            "wgpu does not enable VK_EXT_memory_budget on Mesa's RADV driver (mesa#15725), so the driver states heap sizes and no budget"
+        } else {
+            "the device does not enable VK_EXT_memory_budget, so the driver states heap sizes and no budget"
+        };
+        Ok(wgt::MemoryBudgetReport {
+            heaps,
+            budget_unavailable: Some(reason.into()),
+        })
+    }
+
     fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8> {
         const MAX_U24: u32 = (1u32 << 24u32) - 1u32;
         let temp = RawTlasInstance {
