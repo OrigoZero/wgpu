@@ -2658,6 +2658,77 @@ impl crate::Device for super::Device {
         bytemuck::bytes_of(&Desc::wrap(temp)).to_vec()
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        let adapter = &self.shared.adapter;
+        let desc = unsafe { adapter.GetDesc2() }.map_err(|e| {
+            wgt::MemoryBudgetUnavailable::new(format!(
+                "IDXGIAdapter2::GetDesc2 failed: {e} (HRESULT {:#010x})",
+                e.code().0
+            ))
+        })?;
+        let unified = matches!(
+            self.shared.private_caps.memory_architecture,
+            super::MemoryArchitecture::Unified { .. }
+        );
+
+        let local_size = desc.DedicatedVideoMemory as u64
+            + if unified {
+                desc.DedicatedSystemMemory as u64 + desc.SharedSystemMemory as u64
+            } else {
+                0
+            };
+        let query = |group, heap: &str| {
+            let mut info = Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }
+                .map(|()| info)
+                .map_err(|e| {
+                    format!(
+                        "QueryVideoMemoryInfo failed for the {heap} heap: {e} (HRESULT {:#010x})",
+                        e.code().0
+                    )
+                })
+        };
+        let mut unavailable = Vec::new();
+        let mut heap =
+            |size: u64,
+             device_local: bool,
+             info: Result<Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO, String>| match info {
+                Ok(info) => wgt::MemoryHeapBudget {
+                    size,
+                    budget: Some(info.Budget),
+                    usage: Some(info.CurrentUsage),
+                    device_local,
+                },
+                Err(reason) => {
+                    unavailable.push(reason);
+                    wgt::MemoryHeapBudget {
+                        size,
+                        budget: None,
+                        usage: None,
+                        device_local,
+                    }
+                }
+            };
+
+        let mut heaps = vec![heap(
+            local_size,
+            true,
+            query(Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL, "local"),
+        )];
+        if !unified {
+            heaps.push(heap(
+                desc.SharedSystemMemory as u64,
+                false,
+                query(Dxgi::DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, "non-local"),
+            ));
+        }
+
+        Ok(wgt::MemoryBudgetReport {
+            heaps,
+            budget_unavailable: (!unavailable.is_empty()).then(|| unavailable.join("; ")),
+        })
+    }
+
     fn check_if_oom(&self) -> Result<(), crate::DeviceError> {
         let Some(threshold) = self.mem_allocator.memory_budget_thresholds.for_device_loss else {
             return Ok(());
