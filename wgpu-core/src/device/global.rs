@@ -1984,6 +1984,14 @@ impl Global {
         device.generate_allocator_report()
     }
 
+    pub fn device_memory_budget(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        let device = self.hub.devices.get(device_id);
+        device.memory_budget()
+    }
+
     #[cfg(feature = "trace")]
     pub fn device_take_trace(
         &self,

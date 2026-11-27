@@ -5495,6 +5495,10 @@ impl Device {
     pub fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport> {
         self.raw().generate_allocator_report()
     }
+
+    pub fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        self.raw().memory_budget()
+    }
 }
 
 crate::impl_resource_type!(Device);

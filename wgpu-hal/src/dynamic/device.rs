@@ -178,6 +178,7 @@ pub trait DynDevice: DynResource {
 
     fn get_internal_counters(&self) -> wgt::HalCounters;
     fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport>;
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable>;
 
     fn check_if_oom(&self) -> Result<(), DeviceError>;
 }
@@ -614,6 +615,10 @@ impl<D: Device + DynResource> DynDevice for D {
 
     fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport> {
         D::generate_allocator_report(self)
+    }
+
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        D::memory_budget(self)
     }
 
     fn check_if_oom(&self) -> Result<(), DeviceError> {

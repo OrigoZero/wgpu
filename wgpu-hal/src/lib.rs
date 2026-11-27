@@ -1211,6 +1211,15 @@ pub trait Device: WasmNotSendSync {
         None
     }
 
+    /// The device's memory heaps with the budget and usage the backend states for each.
+    ///
+    /// Returns the reason when the backend states no memory heaps.
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        Err(wgt::MemoryBudgetUnavailable::new(
+            "this backend states no GPU memory heaps",
+        ))
+    }
+
     fn check_if_oom(&self) -> Result<(), DeviceError>;
 }
 

@@ -1812,6 +1812,12 @@ impl crate::Device for super::Device {
         self.counters.as_ref().clone()
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        Err(wgt::MemoryBudgetUnavailable::new(
+            "the GLES backend states no GPU memory heaps",
+        ))
+    }
+
     fn check_if_oom(&self) -> Result<(), crate::DeviceError> {
         Ok(())
     }

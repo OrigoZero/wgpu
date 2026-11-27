@@ -671,6 +671,25 @@ impl Device {
         self.inner.generate_allocator_report()
     }
 
+    /// The device's memory heaps with the budget and usage the backend states for each.
+    ///
+    /// A heap's `budget` is what the operating system states this process may hold in
+    /// it now and its `usage` is what the process holds. `budget` is a statement of the
+    /// system and not a bound: it can exceed the heap's `size` (NVIDIA's Vulkan driver
+    /// states a host-heap budget of 102135 MiB for a heap of 64314 MiB), and `usage` can
+    /// exceed `budget`. The headroom a process has is read on the device-local heaps.
+    ///
+    /// A heap's `budget` and `usage` are `None` where the backend states heap sizes and
+    /// no budget (a Vulkan device without `VK_EXT_memory_budget`, or on Mesa's RADV,
+    /// where wgpu removes the extension), and the report's `budget_unavailable` says
+    /// why. The report is read from the driver at each call.
+    ///
+    /// Backends that state no memory heaps, the browser's WebGPU among them, return
+    /// the reason.
+    pub fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        self.inner.memory_budget()
+    }
+
     /// Get the [`wgpu_hal`] device from this `Device`.
     ///
     /// Find the Api struct corresponding to the active backend in [`wgpu_hal::api`],

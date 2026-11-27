@@ -3055,6 +3055,12 @@ impl dispatch::DeviceInterface for WebDevice {
         None
     }
 
+    fn memory_budget(&self) -> Result<wgt::MemoryBudgetReport, wgt::MemoryBudgetUnavailable> {
+        Err(wgt::MemoryBudgetUnavailable::new(
+            "the browser states no GPU memory figure",
+        ))
+    }
+
     fn destroy(&self) {
         self.inner.destroy();
     }
